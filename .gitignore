@@ -1,0 +1,59 @@
+# Dependencies
+node_modules/
+
+# Environment files and secrets
+.env
+.env.*
+!.env.example
+
+# Logs and local runtime output
+*.log
+logs/
+pids/
+*.pid
+
+# Node.js tooling and coverage
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.npm/
+.nyc_output/
+coverage/
+
+# Python caches and environments
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+ENV/
+
+# Frontend build output
+dist/
+build/
+.next/
+.nuxt/
+.vite/
+
+# Hardhat generated files
+blockchain/artifacts/
+blockchain/cache/
+
+# Local evidence uploads and generated runtime data
+backend/storage/evidence/*
+!backend/storage/evidence/.gitkeep
+
+# OS and editor files
+.DS_Store
+Thumbs.db
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+
+
+crime-in-india-datasets/
