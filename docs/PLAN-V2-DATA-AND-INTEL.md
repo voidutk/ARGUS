@@ -204,12 +204,19 @@ intact if it is ever wanted again.
 
 | Check | Command | Result |
 |---|---|---|
-| Seed determinism | two runs, content-hashed | **identical** — 220 / 962 / 1,211 / 71 / 292 |
+| Unit — logic in isolation | `npm run test:unit` | **20/20** — normalisation, graph algorithms, NCRB name mapping, security helpers |
+| Seed determinism | `npm run verify-determinism` | **PASS** — two runs, content-hashed, byte-identical: 220 / 962 / 1,211 / 71 / 292 |
 | Planted topology | `npm run verify-plant` | **3/3 PASS** — coordinators rank #1, and are the top 3 nodes graph-wide |
 | API surface | `npm run smoke` | **34/34** — asserts response shapes, not just status codes |
+| v2 features + error paths | `npm run smoke-v2` | **43/43** — §2/§3.1/§3.2/§3.3/§3.4, plus every 4xx path |
 | Evidence + tamper | `npm run evidence-e2e` | **18/18** — tamper detected and permanently recorded on-chain |
 | Contract | `npm --prefix blockchain test` | **17/17** |
-| All three API suites | `npm run verify-all` | runs them in order |
+| Everything, in order | `npm run verify-all` | **119 assertions** |
+
+The determinism claim above used to be an assertion with no script behind it.
+`verify-determinism` now hashes complaint narratives, entity values, transaction
+amounts and cluster metadata across two independent seed runs, excluding serial
+ids so it fails only for reasons that matter.
 
 **What is actually built:**
 
@@ -250,6 +257,32 @@ mismatch is appended to the on-chain custody trail beside the earlier pass:
 
 If that second line could be suppressed, the blockchain would be decoration.
 
+### Backend hardening pass — complete
+
+Everything in §2, §3.1–§3.4 is built, wired and covered by `smoke-v2`. The
+backend also went through a production-readiness pass; the items below were real
+defects, not polish.
+
+| Fixed | Was |
+|---|---|
+| Complaint refs come from a Postgres sequence | `SELECT max()+1` raced — two simultaneous intakes built the same ref and one died on the UNIQUE constraint. Verified with 12 concurrent filings. |
+| `pool.on('error')` listener | A `pg` Pool is an EventEmitter; an idle client losing its connection emits `error`, and no listener means a **throw that kills the process**. Verified by stopping Postgres: the API survived and recovered on its own. |
+| Every input validated at the route | `Number(req.params.id)` on `"abc"` reached Postgres as `NaN` and returned 500. A bad `scam_category` leaked a CHECK constraint name to the caller. |
+| Empty query values treated as absent | `?state=&category=X` — what every form sends with a filter cleared — returned 400. |
+| Evidence downloads forced to `octet-stream` | The uploader's MIME type was echoed back, so an uploaded `.html` or `.svg` exhibit would **render in an investigator's browser on the API origin with their session**. |
+| `Content-Disposition` escaped per RFC 6266 | The filename is attacker-controlled and was interpolated raw — a quote or CRLF injected a header of the uploader's choosing. |
+| Migrations applied once, checksummed, advisory-locked | Every `.sql` file re-ran on every invocation, which works exactly until the first `ALTER TABLE`. |
+| Circuit breaker on intel-service | Every call paid the full 8s timeout while FastAPI was down, so `POST /api/complaints` missed its 3s §T budget for being *correctly* optional. |
+| `total` is the result size | `/api/entities` returned `total: rows.length` — the page size. A client paginating on it stopped after one page. |
+| Geo dominant-category via window function | Was a correlated subquery re-aggregating the complaints table once per state. |
+| Graph cache single-flighted | A cold cache plus concurrent requests ran a full Brandes betweenness per request. |
+| Alerts generated, not seeded | Eight hand-written rows claiming "reused across 14 complaints in 6 states" — numbers computed from nothing, which would have said 14 and 6 whatever the data did. |
+
+Also added: helmet, compression, `trust proxy`, structured logging with request
+ids, three-tier rate limiting keyed by user or IPv6 /64, graceful shutdown with
+drain, `/health` vs `/health/ready` split, boot-time config validation that
+refuses the example JWT secret and the all-zero encryption key in production.
+
 **One blocker remains:** the frontend has not been started.
 
 
@@ -288,7 +321,34 @@ Two additions to the eight scenes in PROJECT.md §T:
 
 ## 8. Immediate next steps
 
-1. Decide the port question in §5 (one line from you).
-2. Smoke-test every endpoint against the seeded database; fix what breaks.
-3. Write `load-reference-data.js` and the state-name normaliser.
-4. Start the frontend: theme tokens, Shell, Login, provenance badge component.
+Items 1–3 are done. `npm run setup` is the whole cold start: migrate, seed, load
+31,360 NCRB rows, generate the threat feed.
+
+1. ~~Decide the port question in §5.~~ Done — :4000 / :5432 / :7474 / :8545.
+2. ~~Smoke-test every endpoint against the seeded database.~~ Done — 119 assertions green.
+3. ~~Write `load-reference-data.js` and the state-name normaliser.~~ Done — every
+   state name matches, 491 rollup rows correctly skipped, and district sums
+   reconcile exactly with NCRB's own published totals (Karnataka 2012 cheating:
+   5,822 = 5,822). All 18 states in our complaints have reference data, so no
+   part of the map renders blank.
+4. **Start the frontend** — theme tokens, Shell, Login, provenance badge.
+
+Notes for whoever picks up the frontend:
+
+- The provenance badge is driven by a `provenance` field in the payload, not by
+  which page you are on. `/api/reference/*` returns `NCRB · OFFICIAL`;
+  `/api/geo/*` returns `SYNTHETIC`; every OSINT result carries `simulated`.
+- Build the Geo year selector from `/api/reference/meta`, not a hardcoded range.
+- `/api/graph/why/:nodeId` returns a `method` block explaining how each figure
+  was derived. Show it. An explanation hidden behind a tooltip is not one.
+- List endpoints return `{ items, total, limit, offset, has_more }`. Page on
+  `has_more`, not on comparing lengths.
+- Errors are `{ error, code, request_id }`. Show `error`; keep `request_id` for
+  bug reports.
+
+**Known gap, stated rather than hidden:** the `CIRCULAR_FLOW` rule matches 0 rows
+against the current seed, because the seeded money flow is a linear ladder —
+victim → mule → mule → exchange — with no cycles in it. The rule is correct and
+will fire on layered data; there simply is none to find. Either plant a cycle in
+the generator (and re-verify the plant), or leave it and say so if asked. Do not
+fabricate an alert to make the feed look busier.

@@ -42,8 +42,23 @@ function loadAbi() {
   return JSON.parse(fs.readFileSync(file, 'utf8'));
 }
 
-/** Idempotent. Safe to call repeatedly; never throws. */
-async function init() {
+let initInFlight = null;
+
+/**
+ * Idempotent. Safe to call repeatedly; never throws.
+ *
+ * Single-flighted: `anchorEvidence` and `verifyOnChain` both re-init when the
+ * chain is not ready, so a batch of uploads arriving while the RPC is down
+ * would otherwise open a provider connection and probe the network once per
+ * exhibit. Sharing the in-flight promise means one probe serves all of them.
+ */
+function init() {
+  if (initInFlight) return initInFlight;
+  initInFlight = doInit().finally(() => { initInFlight = null; });
+  return initInFlight;
+}
+
+async function doInit() {
   const network = env.chainNetwork;
   try {
     const deployment = loadDeployment(network);
@@ -59,7 +74,9 @@ async function init() {
     // Fail fast rather than hanging the first upload on a dead RPC.
     const net = await Promise.race([
       provider.getNetwork(),
-      new Promise((_, rej) => setTimeout(() => rej(new Error('RPC timeout')), 4000)),
+      new Promise((_, rej) =>
+        setTimeout(() => rej(new Error(`RPC did not answer within ${env.chainProbeTimeoutMs}ms`)),
+          env.chainProbeTimeoutMs)),
     ]);
 
     let signer;
