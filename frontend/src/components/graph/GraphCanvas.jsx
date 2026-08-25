@@ -169,7 +169,34 @@ export default function GraphCanvas({
       const neighbourhood = node.closedNeighborhood();
       cy.elements().difference(neighbourhood).addClass('faded');
       neighbourhood.addClass('highlighted');
-      neighbourhood.nodes().addClass('labelled');
+
+      /**
+       * Label the selected node and its strongest neighbours only.
+       *
+       * Labelling the whole neighbourhood is what it looked like it should do,
+       * and on a 25-degree coordinator it produced a pile of overlapping text —
+       * "Caller A — Ritu Mehta" sitting on top of "HDFC Bank mule A" — which is
+       * strictly worse than no labels at all. Cytoscape has no label-collision
+       * solver, so the fix is to ask for fewer.
+       *
+       * Ten is roughly what fits around one node without collisions at this
+       * zoom, and taking them by influence means the ones that survive are the
+       * ones worth reading.
+       */
+      const LABEL_CAP = 9;
+
+      // Materialised to a plain array before sorting and slicing. Cytoscape
+      // collections expose their own `sort`/`slice`, and chaining them here
+      // silently left every neighbour labelled — the overlap this cap exists to
+      // prevent. An array does exactly what it says.
+      node.addClass('labelled');
+      neighbourhood
+        .nodes()
+        .toArray()
+        .filter((n) => n.id() !== selectedId)
+        .sort((a, b) => (b.data('influence') ?? 0) - (a.data('influence') ?? 0))
+        .slice(0, LABEL_CAP)
+        .forEach((n) => n.addClass('labelled'));
 
       cy.$(':selected').unselect();
       node.select();

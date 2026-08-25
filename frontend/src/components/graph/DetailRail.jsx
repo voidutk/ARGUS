@@ -129,10 +129,10 @@ function WhyPanel({ nodeId }) {
 
       {paths?.length > 0 && (
         <Section
-          title="Routes through this node"
+          title="Routes through"
           right={
-            <span className="mn text-[10px] text-faint">
-              {data.severing_pair_count} of {data.bridge_pair_count} sever
+            <span className="mn shrink-0 text-[10px] whitespace-nowrap text-faint">
+              {data.severing_pair_count}/{data.bridge_pair_count} cut
             </span>
           }
         >

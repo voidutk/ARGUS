@@ -84,9 +84,14 @@ export const stylesheet = [
     selector: 'node[type = "COMPLAINT"]',
     style: {
       shape: 'round-rectangle',
-      'background-opacity': 0.75,
-      'border-color': '#1a2333',
-      color: '#556074',
+      'background-opacity': 0.95,
+      // Lifted off the canvas. At #2a3446 on a #080b12 ground these read as
+      // holes punched in the background rather than as objects, and complaints
+      // are ~30% of the opening view — a third of the picture looked like a gap.
+      'background-color': '#39455c',
+      'border-color': '#4a5875',
+      'border-width': 1,
+      color: '#8b9bb4',
     },
   },
 
@@ -101,6 +106,26 @@ export const stylesheet = [
   {
     selector: 'node.labelled',
     style: { 'text-opacity': 1, color: '#c2cfe0' },
+  },
+
+  /**
+   * Flagged entities.
+   *
+   * Deliberately understated: 62% of the entities in the opening view carry
+   * this flag, and a marker that fires on two nodes in three is decoration, not
+   * a signal — it made the whole graph read as uniformly alarming while telling
+   * an investigator nothing about where to look. Size (influence) and colour
+   * (cluster) are the encodings that actually discriminate here; risk gets its
+   * proper explanation in the detail rail, where there is room to say WHY.
+   *
+   * Declared BEFORE the coordinator rule below so a flagged coordinator — which
+   * all of them are — still gets its white ring. Later rules win in Cytoscape,
+   * and with these two swapped the single most important mark on the page was
+   * being overwritten by the least discriminating one.
+   */
+  {
+    selector: 'node[?is_flagged]',
+    style: { 'border-color': '#6e3644', 'border-width': 1.5 },
   },
 
   /**
@@ -122,11 +147,6 @@ export const stylesheet = [
       'text-margin-y': 7,
       'z-index': 20,
     },
-  },
-
-  {
-    selector: 'node[?is_flagged]',
-    style: { 'border-color': '#ff4757', 'border-width': 2 },
   },
 
   // ---- edges -------------------------------------------------------------
@@ -164,13 +184,20 @@ export const stylesheet = [
     selector: '.faded',
     style: { 'background-opacity': 0.12, opacity: 0.06, 'text-opacity': 0 },
   },
+  /**
+   * A node in the selected neighbourhood.
+   *
+   * Controls EMPHASIS ONLY — deliberately no `text-opacity`. It used to set it,
+   * which quietly overrode the label cap in GraphCanvas: every neighbour of a
+   * 25-degree coordinator got a label, and the result was a pile of overlapping
+   * text that was worse than no labels at all. Two classes, two jobs:
+   * `highlighted` says "in scope", `labelled` says "worth naming".
+   */
   {
     selector: 'node.highlighted',
     style: {
       'border-color': '#5b93ff',
       'border-width': 2.5,
-      'text-opacity': 1,
-      color: '#e6edf7',
       'z-index': 30,
     },
   },

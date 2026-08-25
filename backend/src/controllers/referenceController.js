@@ -71,17 +71,73 @@ const states = asyncHandler(async (req, res) => {
  * City, 2014: 3,045 (NCRB)". One real, cited number beside our synthetic
  * network, which is worth more than a page of synthetic numbers alone.
  */
+/**
+ * Resolves our district name to NCRB's.
+ *
+ * They disagree far more often than they agree — only 15 of the 30 districts in
+ * our corpus match exactly. NCRB carries administrative suffixes our complaints
+ * do not: "Bengaluru City", "Hyderabad City", "Pune Commr." (Commissionerate),
+ * "Kanpur Dehat". Matching on equality alone meant the baseline panel silently
+ * vanished for half the country, which reads as missing data rather than as a
+ * naming mismatch.
+ *
+ * Candidates are tried most-specific first, and the name that MATCHED is
+ * returned alongside the figures. That is the important part: "Kanpur" resolving
+ * to "Kanpur Dehat" is arguably the wrong place — Dehat is rural Kanpur, not
+ * the city — and showing the resolved name is what lets a reader catch it
+ * instead of trusting a number attributed to somewhere it did not come from.
+ */
+async function resolveDistrict(state, wanted) {
+  /**
+   * Urban variants are tried before the bare prefix, because our complaints
+   * name CITIES — Pune, Bengaluru, Surat — while NCRB splits each into an
+   * urban and a rural unit. A plain prefix match sorted by name length picks
+   * "Pune Rural" over "Pune Commr.", attributing a city complaint's baseline to
+   * the surrounding countryside, where the figures are several times lower.
+   *
+   * "Commr." is a Commissionerate: the metropolitan police jurisdiction, which
+   * is the right counterpart to a city complaint. "Nagar" likewise distinguishes
+   * urban Kanpur from "Kanpur Dehat".
+   */
+  const attempts = [
+    { param: wanted, exact: true },
+    { param: `${wanted} City`, exact: false },
+    { param: `${wanted} Commr.`, exact: false },
+    { param: `${wanted} Nagar`, exact: false },
+    { param: `${wanted} Urban`, exact: false },
+    { param: `${wanted}%`, exact: false },
+    { param: `%${wanted}%`, exact: false },
+  ];
+
+  for (const attempt of attempts) {
+    const { rows } = await pool.query(
+      `SELECT district FROM crime_reference
+        WHERE state = $1 AND district ILIKE $2
+        GROUP BY district
+        ORDER BY count(*) DESC, length(district) ASC
+        LIMIT 1`,
+      [state, attempt.param]
+    );
+    if (rows[0]) return { district: rows[0].district, exact: attempt.exact };
+  }
+  return null;
+}
+
 const district = asyncHandler(async (req, res) => {
-  const { state, district: districtName } = req.valid.params;
+  const { state, district: requested } = req.valid.params;
+
+  const resolved = await resolveDistrict(state, requested);
+  if (!resolved) throw notFound(`NCRB reference data for ${requested}, ${state}`);
+  const districtName = resolved.district;
 
   const { rows } = await pool.query(
     `SELECT metric, year, value
        FROM crime_reference
-      WHERE state = $1 AND district ILIKE $2
+      WHERE state = $1 AND district = $2
       ORDER BY year DESC, metric`,
     [state, districtName]
   );
-  if (!rows.length) throw notFound(`NCRB reference data for ${districtName}, ${state}`);
+  if (!rows.length) throw notFound(`NCRB reference data for ${requested}, ${state}`);
 
   const latestYear = Math.max(...rows.map((r) => r.year));
   const latest = Object.fromEntries(
@@ -101,6 +157,11 @@ const district = asyncHandler(async (req, res) => {
   res.json({
     state,
     district: districtName,
+    // What was asked for, and whether NCRB spells it the same way. The UI shows
+    // the resolved name so a figure is never attributed to a place it did not
+    // come from.
+    requested_district: requested,
+    exact_match: resolved.exact,
     provenance: PROVENANCE,
     source_note: SOURCE_NOTE,
     latest_year: latestYear,

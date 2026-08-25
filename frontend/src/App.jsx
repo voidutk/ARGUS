@@ -14,6 +14,11 @@ import { useAuth } from '@/context/AuthContext';
 import Shell from '@/components/shell/Shell';
 import Login from '@/pages/Login';
 import Dashboard from '@/pages/Dashboard';
+import Complaints from '@/pages/Complaints';
+import ComplaintDetail from '@/pages/ComplaintDetail';
+import MoneyFlow from '@/pages/MoneyFlow';
+import ThreatFeed from '@/pages/ThreatFeed';
+import Timeline from '@/pages/Timeline';
 import { Spinner, Empty } from '@/components/ui/Bits';
 
 /**
@@ -84,12 +89,12 @@ export default function App() {
             </Suspense>
           }
         />
-        <Route path="complaints" element={<Planned title="Complaints" />} />
-        <Route path="complaints/:id" element={<Planned title="Complaint Intelligence" />} />
-        <Route path="money" element={<Planned title="Money Flow Analysis" />} />
+        <Route path="complaints" element={<Complaints />} />
+        <Route path="complaints/:id" element={<ComplaintDetail />} />
+        <Route path="money" element={<MoneyFlow />} />
         <Route path="geo" element={<Planned title="Geo Intelligence" />} />
-        <Route path="alerts" element={<Planned title="Threat Feed" />} />
-        <Route path="timeline" element={<Planned title="Investigation Timeline" />} />
+        <Route path="alerts" element={<ThreatFeed />} />
+        <Route path="timeline" element={<Timeline />} />
         <Route path="clusters" element={<Planned title="Criminal Networks" />} />
         <Route path="clusters/:key" element={<Planned title="Network Detail" />} />
         <Route path="evidence" element={<Planned title="Evidence Locker" />} />
