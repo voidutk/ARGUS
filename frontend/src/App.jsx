@@ -19,6 +19,7 @@ import ComplaintDetail from '@/pages/ComplaintDetail';
 import MoneyFlow from '@/pages/MoneyFlow';
 import ThreatFeed from '@/pages/ThreatFeed';
 import Timeline from '@/pages/Timeline';
+import EvidenceLocker from '@/pages/EvidenceLocker';
 import { Spinner, Empty } from '@/components/ui/Bits';
 
 /**
@@ -97,7 +98,7 @@ export default function App() {
         <Route path="timeline" element={<Timeline />} />
         <Route path="clusters" element={<Planned title="Criminal Networks" />} />
         <Route path="clusters/:key" element={<Planned title="Network Detail" />} />
-        <Route path="evidence" element={<Planned title="Evidence Locker" />} />
+        <Route path="evidence" element={<EvidenceLocker />} />
         <Route path="admin" element={<Planned title="Admin" />} />
       </Route>
 
