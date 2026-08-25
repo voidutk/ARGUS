@@ -83,6 +83,10 @@ async function upload(req, res, next) {
     );
     const ev = rows[0];
 
+    // This row exists the instant the file is stored — status PENDING — so the
+    // UI has something to show and poll immediately. `chain.queueAnchor()` a
+    // few lines down is what eventually flips it to ANCHORED or FAILED; this
+    // insert does not wait for that.
     await pool.query(
       `INSERT INTO evidence_anchors (evidence_id, network, status) VALUES ($1,$2,'PENDING')`,
       [ev.id, chain.status().network || 'localhost']
@@ -94,6 +98,9 @@ async function upload(req, res, next) {
       ipAddress: audit.clientIp(req),
     });
 
+    // Fire-and-forget: does not block this response. If the chain is slow or
+    // down, the row above simply stays PENDING — see chainService.js's module
+    // header for why that must never fail this request.
     chain.queueAnchor(ev.id);
 
     res.status(201).json({
@@ -133,6 +140,11 @@ async function verify(req, res, next) {
       readError = e.message;
     }
 
+    // Three independent things all have to line up for this to count as valid:
+    // (1) the file could still be decrypted at all, (2) the hash recomputed
+    // RIGHT NOW from those bytes matches what was recorded at upload time, and
+    // (3) the chain actually has that digest registered. Any one of the three
+    // failing is a real integrity problem, not a fluke to paper over.
     const onChain = await chain.verifyOnChain(ev.sha256_hash);
     const isValid = Boolean(computedHash && computedHash === ev.sha256_hash && onChain.exists);
 
@@ -142,6 +154,10 @@ async function verify(req, res, next) {
       : !onChain.exists ? 'digest matches but is not registered on-chain'
       : 'integrity confirmed';
 
+    // Write the result — pass OR fail — onto the permanent custody trail. Note
+    // that `isValid` (which can be false) is passed straight through as the
+    // `matched` argument: a mismatch gets logged with the same call as a
+    // match, on the same terms, which is the entire point of this system.
     const logged = onChain.available && onChain.exists
       ? await chain.logVerification(ev.sha256_hash, isValid, note)
       : { ok: false, reason: onChain.reason || 'not registered on-chain' };

@@ -24,6 +24,10 @@ module.exports = {
   solidity: {
     version: '0.8.24',
     settings: {
+      // Trades a slightly bigger one-time deploy cost for cheaper gas on every
+      // later call — the right trade for a contract that gets registered once
+      // and read/written to many times. `runs: 200` is Hardhat/Solidity's own
+      // recommended default; nothing here has been hand-tuned for this project.
       optimizer: { enabled: true, runs: 200 },
     },
   },

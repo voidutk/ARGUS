@@ -65,16 +65,33 @@ contract EvidenceRegistry is AccessControl, Pausable {
         address indexed verifier,
         bool matched,
         string note,
-        uint64 at
+        // Named checkedAt, not `at`, for the same reason as the Verification
+        // struct above: ethers v6 decodes event args into Result objects that
+        // inherit Array.prototype, so `at` reads back as a function.
+        uint64 checkedAt
     );
 
-    event EvidenceSealed(bytes32 indexed digest, address indexed by, string reason, uint64 at);
+    event EvidenceSealed(
+        bytes32 indexed digest,
+        address indexed by,
+        string reason,
+        uint64 sealedAt
+    );
 
     error ZeroDigest();
     error AlreadyRegistered(bytes32 digest);
     error NotRegistered(bytes32 digest);
     error AlreadySealed(bytes32 digest);
 
+    // `admin` starts out holding all three: DEFAULT_ADMIN_ROLE (OpenZeppelin's
+    // built-in "root" role — can grant/revoke ADMIN_ROLE), ADMIN_ROLE (can
+    // seal evidence, pause/unpause, and grant/revoke REGISTRAR_ROLE), and
+    // REGISTRAR_ROLE (can register evidence and log verifications). In this
+    // project that one address is the backend's relayer wallet — see
+    // chainService.js's `init()`, which signs every transaction as this same
+    // account. Extra investigator wallets can be granted REGISTRAR_ROLE later
+    // via `grantRole()` (inherited from AccessControl) without touching this
+    // contract again.
     constructor(address admin) {
         if (admin == address(0)) admin = msg.sender;
         _grantRole(DEFAULT_ADMIN_ROLE, admin);
@@ -167,6 +184,12 @@ contract EvidenceRegistry is AccessControl, Pausable {
         emit EvidenceSealed(digest, msg.sender, reason, uint64(block.timestamp));
     }
 
+    // `_digests` (declared up top) exists purely so the outside world can list
+    // every exhibit ever registered, in order, without needing to already know
+    // their hashes — a `mapping` alone has no way to enumerate its own keys.
+    // This pair is what powers the Evidence Locker's ledger view: loop
+    // `i` from 0 to totalRegistered(), call digestAt(i), then verifyEvidence()
+    // on each to build the full list.
     function totalRegistered() external view returns (uint256) {
         return _digests.length;
     }
