@@ -278,13 +278,45 @@ Internal. CORS is locked to the Express origin. No JWT — network-isolated.
 | `POST` | `/extract` | `{narrative, complaint_id?}` | `{entities[], duration_ms}` |
 | `POST` | `/ingest` | `{complaint, entities[], transactions[]}` | `{nodes_merged, edges_merged}` |
 | `POST` | `/ingest/bulk` | `{complaints[]}` | `{ingested, nodes, edges}` |
-| `POST` | `/analytics/run` | — | `{clusters[], nodes_scored, duration_ms}` |
-| `GET` | `/graph/overview` | `?limit=150` | `{nodes[], edges[], stats}` |
-| `GET` | `/graph/neighbors/{node_id}` | `?depth=1&limit=50` | `{nodes[], edges[]}` |
-| `GET` | `/graph/cluster/{cluster_key}` | — | `{nodes[], edges[], cluster}` |
+| `POST` | `/analytics/run` | — | **501 — delegated to Express** |
+| `GET` | `/graph/overview` | `?limit=150` | **501 — delegated to Express** |
+| `GET` | `/graph/neighbors/{node_id}` | `?depth=1&limit=50` | **501 — delegated to Express** |
+| `GET` | `/graph/cluster/{cluster_key}` | — | **501 — delegated to Express** |
 
-`/analytics/run` returns cluster summaries; **Express writes them to Postgres.**
 FastAPI never touches Postgres.
+
+### The 501s are a boundary, not a gap
+
+Express already computes PageRank, Brandes betweenness, connected components and
+label-propagation communities over Postgres. That implementation is unit-tested
+and independently verified by `scripts/verify-plant.js`, which proves centrality
+ranks the planted coordinators first. A second NetworkX copy in FastAPI would be
+two implementations of the same maths that can silently disagree about **who the
+coordinator is** — the one claim this whole project rests on.
+
+`intelClient.js` reads 501 as a definitive *capability* answer rather than a
+failure: it falls back to the proven path and **does not count it against the
+circuit breaker**. Without that distinction three dashboard loads would trip the
+breaker, and `/extract` — which the service does implement — would start failing
+fast for a service that is perfectly healthy.
+
+### Extraction cannot break
+
+`POST /api/complaints` tries FastAPI first and falls back to a regex tier inside
+Express (`backend/src/services/localExtract.js`). §T scene 2 is the one moment
+that must be genuinely live, and it is the only degradation that would produce
+an *empty panel* rather than a staler picture. The response says which tier ran:
+
+```jsonc
+"extraction": { "tier": "intel-service", "degraded": false, "count": 7, "duration_ms": 23 }
+"extraction": { "tier": "express-regex", "degraded": true, "count": 6,
+                "reason": "intel-service unreachable (ECONNREFUSED)" }
+```
+
+**A regex-only result is never presented as though the AI service produced it.**
+The UI must surface `degraded`. Both tiers share fixtures
+(`backend/test/extract.test.js` ↔ `intel-service/tests/test_extract.py`) so the
+two pattern sets cannot drift apart unnoticed.
 
 ### Degradation rules — non-negotiable
 

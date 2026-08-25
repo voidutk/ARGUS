@@ -26,7 +26,16 @@ const overview = asyncHandler(async (req, res) => {
   if (live.ok) return res.json({ ...live.data, source: 'intel-service' });
 
   const data = await graph.overview({ limit });
-  res.json({ ...data, source: 'postgres-fallback', degraded_reason: live.reason });
+  res.json({
+    ...data,
+    source: 'postgres-fallback',
+    // `delegated` separates "this is where the maths lives" from "something
+    // broke". Both fall back to Postgres, but only one of them warrants an
+    // alarm in the UI — and calling a healthy service an outage is its own kind
+    // of dishonesty.
+    delegated: Boolean(live.delegated),
+    degraded_reason: live.reason,
+  });
 });
 
 const neighbors = asyncHandler(async (req, res) => {
@@ -38,7 +47,12 @@ const neighbors = asyncHandler(async (req, res) => {
 
   const data = await graph.neighbors(nodeId, { depth, limit });
   if (data.error) throw notFound('Node');
-  res.json({ ...data, source: 'postgres-fallback', degraded_reason: live.reason });
+  res.json({
+    ...data,
+    source: 'postgres-fallback',
+    delegated: Boolean(live.delegated),
+    degraded_reason: live.reason,
+  });
 });
 
 const cluster = asyncHandler(async (req, res) => {
@@ -49,7 +63,12 @@ const cluster = asyncHandler(async (req, res) => {
 
   const data = await graph.cluster(clusterKey);
   if (!data) throw notFound('Cluster');
-  res.json({ ...data, source: 'postgres-fallback', degraded_reason: live.reason });
+  res.json({
+    ...data,
+    source: 'postgres-fallback',
+    delegated: Boolean(live.delegated),
+    degraded_reason: live.reason,
+  });
 });
 
 /**

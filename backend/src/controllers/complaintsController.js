@@ -3,6 +3,7 @@ const intel = require('../services/intelClient');
 const graph = require('../services/graphService');
 const audit = require('../services/auditService');
 const alertRules = require('../services/alertRules');
+const localExtract = require('../services/localExtract');
 const { normalize } = require('../services/normalize');
 const { asyncHandler, notFound } = require('../lib/errors');
 const logger = require('../lib/logger');
@@ -169,11 +170,36 @@ async function nextRef(client) {
 const create = asyncHandler(async (req, res) => {
   const body = req.valid.body;
 
-  // Extraction happens BEFORE the transaction opens. It is a network call to an
-  // optional service with an 8-second ceiling, and holding a pooled connection
-  // and row locks across it would let a slow AI service exhaust the pool.
+  /**
+   * Extraction happens BEFORE the transaction opens. It is a network call to an
+   * optional service with an 8-second ceiling, and holding a pooled connection
+   * and row locks across it would let a slow AI service exhaust the pool.
+   *
+   * intel-service is tried first because extraction is genuinely its job and it
+   * carries the NER tier. When it cannot answer, Express runs the deterministic
+   * regex tier itself rather than filing a complaint with no entities: §T scene
+   * 2 is the one moment that must be live, and it is the one place where a dead
+   * optional service produces an empty panel instead of a staler picture.
+   *
+   * `extraction.tier` records which one answered, and it is returned to the
+   * client — so a regex-only result is never presented as though the full
+   * intelligence service produced it.
+   */
   const startedAt = Date.now();
-  const extraction = await intel.extract(body.narrative);
+  let extraction = await intel.extract(body.narrative);
+  let tier = 'intel-service';
+  let degradedReason = null;
+
+  if (!extraction.ok) {
+    degradedReason = extraction.reason;
+    const local = localExtract.extract(body.narrative);
+    extraction = { ok: true, data: local, reason: null };
+    tier = 'express-regex';
+    logger.warn(
+      { reason: degradedReason, found: local.entities.length },
+      'intel-service unavailable — extracted with the local regex tier'
+    );
+  }
   const extractionMs = Date.now() - startedAt;
 
   const { complaint, linkedEntities } = await pool.withTransaction(async (client) => {
@@ -293,8 +319,14 @@ const create = asyncHandler(async (req, res) => {
     linked_count: linkQ.rows[0].n,
     cluster: clusterQ.rows[0] || null,
     extraction: {
-      available: extraction.ok,
-      reason: extraction.ok ? null : extraction.reason,
+      available: true,
+      // Which tier actually answered. The UI shows this, because a regex-only
+      // result must never be presented as though the intelligence service
+      // produced it — and because "the AI service was down and we still found
+      // five identifiers" is a better story than a silent downgrade.
+      tier,
+      degraded: tier !== 'intel-service',
+      reason: degradedReason,
       count: linkedEntities.length,
       duration_ms: extractionMs,
     },

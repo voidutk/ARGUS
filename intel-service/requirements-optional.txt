@@ -1,0 +1,26 @@
+# Optional — the NER tier only.
+#
+#   pip install -r requirements-optional.txt
+#   python -m spacy download en_core_web_sm
+#
+# docs/PROJECT.md §4 is explicit that REGEX CARRIES THE DEMO and NER is strictly
+# additive. Without these, /extract still returns every phone, UPI id, bank
+# account, wallet, email, IP and Telegram handle in a narrative — which is every
+# identifier the correlation engine actually links on. What is lost is the soft
+# PERSON and LOCATION tier, and /health reports that plainly rather than quietly
+# returning fewer entities.
+#
+# Worth knowing before you try: spaCy has no wheels for Python 3.14 at the time
+# of writing, so on a 3.14 interpreter this will attempt a source build and
+# probably fail. That is not a problem to solve on demo day — the service is
+# designed to run without it. If you want the NER tier, use a 3.12 interpreter.
+spacy>=3.8
+
+# Neither of these is used. Graph analytics run in the Express core API over
+# Postgres, where they are unit-tested and independently verified by
+# scripts/verify-plant.js; this service answers 501 for those routes on purpose
+# rather than keeping a second implementation of the same maths that could
+# disagree about who the coordinator is. Listed only so the reason is recorded
+# where someone would otherwise re-add them.
+# networkx>=3.4
+# python-louvain>=0.16

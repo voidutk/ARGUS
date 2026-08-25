@@ -331,7 +331,13 @@ Items 1–3 are done. `npm run setup` is the whole cold start: migrate, seed, lo
    reconcile exactly with NCRB's own published totals (Karnataka 2012 cheating:
    5,822 = 5,822). All 18 states in our complaints have reference data, so no
    part of the map renders blank.
-4. **Start the frontend** — theme tokens, Shell, Login, provenance badge.
+4. ~~Start the frontend~~ — scaffolded. Vite + React + Tailwind v4 + shadcn
+   tokens, `Bits.jsx` primitives, Shell, Login and Dashboard are built and wired
+   to live data. Nine pages remain as honest stubs.
+5. ~~intel-service~~ — **built.** `/health` + `/extract` (regex tier) + Neo4j
+   ingest. Scene 2 is genuinely live: 7 identifiers out of a real narrative in
+   23ms, auto-linked to 14 existing complaints and cluster ALPHA.
+6. **Network Explorer** — the centrepiece, and the next thing to build.
 
 Notes for whoever picks up the frontend:
 
@@ -345,6 +351,18 @@ Notes for whoever picks up the frontend:
   `has_more`, not on comparing lengths.
 - Errors are `{ error, code, request_id }`. Show `error`; keep `request_id` for
   bug reports.
+
+**Scene 2 has two tiers and cannot break.** FastAPI owns extraction; Express
+falls back to its own regex tier when the service is unreachable, and the
+response labels which one ran (`extraction.tier`, `extraction.degraded`). The
+fixtures are shared between both implementations so they cannot drift.
+
+**spaCy is not installed and that is fine.** It has no wheels for Python 3.14,
+and §4 says regex carries the demo while NER is strictly additive. `/health`
+reports `spacy_loaded: false` plainly rather than quietly returning fewer
+entities. Every identifier the correlation engine links on — phone, UPI, bank
+account, wallet, email, IP, Telegram — comes from the deterministic tier. Only
+the soft PERSON/LOCATION tier is absent; use a 3.12 interpreter if it is wanted.
 
 **Known gap, stated rather than hidden:** the `CIRCULAR_FLOW` rule matches 0 rows
 against the current seed, because the seeded money flow is a linear ladder —

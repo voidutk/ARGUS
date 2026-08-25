@@ -77,6 +77,38 @@ async function call(method, path, body, { timeout, bypassBreaker = false } = {})
     breaker.recordSuccess();
     return { ok: true, data: res.data, reason: null };
   } catch (err) {
+    /**
+     * 501 is a CAPABILITY answer, not a failure.
+     *
+     * intel-service deliberately does not implement the analytics and graph
+     * reads — Express already computes those over Postgres, that code is
+     * unit-tested and proven by verify-plant, and a second NetworkX copy could
+     * silently disagree about who the coordinator is. The service says so with
+     * a 501.
+     *
+     * Counting that against the breaker would be actively harmful: three
+     * dashboard loads would trip it, and `/extract` — which the service DOES
+     * implement and which Scene 2 depends on — would start failing fast for a
+     * service that is perfectly healthy. So a 501 falls back without any
+     * effect on health, and it resets the breaker, because receiving one is
+     * proof the service answered.
+     */
+    if (err.response?.status === 501) {
+      breaker.recordSuccess();
+      return {
+        ok: false,
+        // A SHORT reason. The service's own `detail` is a paragraph written for
+        // a developer reading logs, and it was being piped straight into a UI
+        // banner where it filled four lines and read like an outage. The long
+        // form stays available on `detail` for anyone who wants it.
+        reason: 'computed by the Express core API',
+        detail: err.response.data?.detail || null,
+        data: null,
+        delegated: true,
+        circuit: breaker.state(),
+      };
+    }
+
     const reason =
       err.code === 'ECONNABORTED' || err.code === 'ETIMEDOUT'
         ? `intel-service timed out after ${timeout || env.intelTimeoutMs}ms`

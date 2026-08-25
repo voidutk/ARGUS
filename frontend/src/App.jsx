@@ -7,6 +7,7 @@
  * layout verifiable before the pages land.
  */
 
+import { lazy, Suspense } from 'react';
 import { Navigate, Route, Routes } from 'react-router-dom';
 
 import { useAuth } from '@/context/AuthContext';
@@ -14,6 +15,24 @@ import Shell from '@/components/shell/Shell';
 import Login from '@/pages/Login';
 import Dashboard from '@/pages/Dashboard';
 import { Spinner, Empty } from '@/components/ui/Bits';
+
+/**
+ * The Explorer is loaded on demand.
+ *
+ * Cytoscape and its layout engine are ~600 kB, and bundling them into the entry
+ * chunk means the LOGIN page downloads a graph library before anyone has
+ * authenticated. Splitting here keeps first paint light and pays the cost only
+ * when an investigator actually opens the network.
+ */
+const NetworkExplorer = lazy(() => import('@/pages/NetworkExplorer'));
+
+function PageLoading() {
+  return (
+    <div className="flex h-full items-center justify-center">
+      <Spinner size={16} />
+    </div>
+  );
+}
 
 /** A page that is planned but not built. Named so the gap is visible. */
 function Planned({ title, note }) {
@@ -57,7 +76,14 @@ export default function App() {
         }
       >
         <Route index element={<Dashboard />} />
-        <Route path="network" element={<Planned title="Criminal Network Explorer" />} />
+        <Route
+          path="network"
+          element={
+            <Suspense fallback={<PageLoading />}>
+              <NetworkExplorer />
+            </Suspense>
+          }
+        />
         <Route path="complaints" element={<Planned title="Complaints" />} />
         <Route path="complaints/:id" element={<Planned title="Complaint Intelligence" />} />
         <Route path="money" element={<Planned title="Money Flow Analysis" />} />

@@ -178,23 +178,97 @@ function inducedEdges(edges, keep) {
 /**
  * Opening view of the Network Explorer.
  *
- * Seeded with the highest-influence nodes rather than a random sample — an
- * investigator opening the page should land on the organisations, not on 150
- * unrelated one-off complaints. Everything else arrives by expansion.
+ * An investigator opening this page must land on the ORGANISATIONS. The
+ * previous implementation ranked every node by influence and took the top N,
+ * which sounds like the same thing and is not: it returned 150 nodes with 22
+ * edges between them, 125 of them isolated, and 119 of the 150 were complaints.
+ *
+ * Two things went wrong, and both are worth naming because they are easy to
+ * reintroduce:
+ *
+ *   1. Complaints dominate an influence ranking BY CONSTRUCTION. A complaint
+ *      node sits between the entities named in it, so it scores high on
+ *      betweenness — every complaint is a bridge. Ranking all node types
+ *      together therefore fills the view with complaint boxes and pushes out
+ *      the coordinators and infrastructure the page exists to show.
+ *
+ *   2. Top-N-by-score is not a connected subgraph. The highest-influence nodes
+ *      are spread across separate organisations, so inducing edges over them
+ *      yields almost none — a scatter plot, not a network.
+ *
+ * So the view is GROWN instead of sliced. Seed with the highest-influence
+ * ENTITIES, then expand outward along real edges, always taking the most
+ * influential unvisited neighbour next. The result is connected by
+ * construction, centred on the organisations, and complaints appear where they
+ * belong — hanging off the entities that link them, which is exactly the
+ * picture §T scene 3 describes.
  */
 async function overview({ limit = 150 } = {}) {
-  const { nodes, edges, clusters, mastermindByCluster } = await load();
-  const ranked = [...nodes.values()].sort((a, b) => b.influence - a.influence);
-  const keep = new Set(ranked.slice(0, limit).map((n2) => n2.id));
+  const { nodes, edges, g, clusters, mastermindByCluster } = await load();
 
-  const kept = ranked.filter((n2) => keep.has(n2.id));
+  const entities = [...nodes.values()]
+    .filter((n) => n.type !== 'COMPLAINT')
+    .sort((a, b) => b.influence - a.influence);
+
+  const keep = new Set();
+
+  /**
+   * One seed per cluster first, so no organisation is missing from the opening
+   * shot just because another one outranks it everywhere. Without this a single
+   * dominant cluster can consume the whole budget.
+   */
+  const seeds = [];
+  const seenCluster = new Set();
+  for (const node of entities) {
+    if (node.cluster && !seenCluster.has(node.cluster)) {
+      seenCluster.add(node.cluster);
+      seeds.push(node);
+    }
+  }
+  // Then the strongest remaining entities, whatever their cluster.
+  for (const node of entities) {
+    if (seeds.length >= 12) break;
+    if (!seeds.includes(node)) seeds.push(node);
+  }
+
+  // Breadth-first from every seed at once, always expanding the most
+  // influential frontier node next, so the budget is spent on structure rather
+  // than on whichever branch happened to be walked first.
+  const frontier = [];
+  const pushNode = (id) => {
+    if (keep.has(id) || keep.size >= limit) return;
+    keep.add(id);
+    frontier.push(id);
+  };
+  seeds.forEach((s) => pushNode(s.id));
+
+  while (frontier.length && keep.size < limit) {
+    frontier.sort((a, b) => (nodes.get(b)?.influence ?? 0) - (nodes.get(a)?.influence ?? 0));
+    const current = frontier.shift();
+    const neighbourIds = [...g.neighbors(current)]
+      .filter((id) => !keep.has(id))
+      .sort((a, b) => (nodes.get(b)?.influence ?? 0) - (nodes.get(a)?.influence ?? 0));
+    for (const id of neighbourIds) {
+      if (keep.size >= limit) break;
+      pushNode(id);
+    }
+  }
+
+  const kept = [...keep]
+    .map((id) => nodes.get(id))
+    .filter(Boolean)
+    .sort((a, b) => b.influence - a.influence);
+
+  const shownEdges = inducedEdges(edges, keep);
+
   return {
     nodes: kept,
-    edges: inducedEdges(edges, keep),
+    edges: shownEdges,
     stats: {
       total_nodes: nodes.size,
       total_edges: edges.length,
       shown_nodes: kept.length,
+      shown_edges: shownEdges.length,
       clusters: clusters.length,
       masterminds: [...mastermindByCluster.entries()].map(([k, v]) => ({ cluster: k, label: v.label, id: v.id })),
       source: 'postgres-fallback',
