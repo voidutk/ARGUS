@@ -20,7 +20,10 @@ import MoneyFlow from '@/pages/MoneyFlow';
 import ThreatFeed from '@/pages/ThreatFeed';
 import Timeline from '@/pages/Timeline';
 import EvidenceLocker from '@/pages/EvidenceLocker';
-import { Spinner, Empty } from '@/components/ui/Bits';
+import GeoIntelligence from '@/pages/GeoIntelligence';
+import Networks from '@/pages/Networks';
+import Admin from '@/pages/Admin';
+import { Spinner } from '@/components/ui/Bits';
 
 /**
  * The Explorer is loaded on demand.
@@ -36,20 +39,6 @@ function PageLoading() {
   return (
     <div className="flex h-full items-center justify-center">
       <Spinner size={16} />
-    </div>
-  );
-}
-
-/** A page that is planned but not built. Named so the gap is visible. */
-function Planned({ title, note }) {
-  return (
-    <div className="p-3">
-      <div className="glass">
-        <Empty
-          title={title}
-          hint={note ?? 'This page is planned and its API endpoints are live. The interface has not been built yet.'}
-        />
-      </div>
     </div>
   );
 }
@@ -93,13 +82,13 @@ export default function App() {
         <Route path="complaints" element={<Complaints />} />
         <Route path="complaints/:id" element={<ComplaintDetail />} />
         <Route path="money" element={<MoneyFlow />} />
-        <Route path="geo" element={<Planned title="Geo Intelligence" />} />
+        <Route path="geo" element={<GeoIntelligence />} />
         <Route path="alerts" element={<ThreatFeed />} />
         <Route path="timeline" element={<Timeline />} />
-        <Route path="clusters" element={<Planned title="Criminal Networks" />} />
-        <Route path="clusters/:key" element={<Planned title="Network Detail" />} />
+        <Route path="clusters" element={<Networks />} />
+        <Route path="clusters/:key" element={<Networks />} />
         <Route path="evidence" element={<EvidenceLocker />} />
-        <Route path="admin" element={<Planned title="Admin" />} />
+        <Route path="admin" element={<Admin />} />
       </Route>
 
       <Route path="*" element={<Navigate to="/" replace />} />
