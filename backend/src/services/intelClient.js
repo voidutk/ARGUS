@@ -1,6 +1,3 @@
-const axios = require('axios');
-const env = require('../config/env');
-
 /**
  * Client for the FastAPI intelligence service (entity extraction, Neo4j, analytics).
  *
@@ -14,22 +11,80 @@ const env = require('../config/env');
  * succeeds is worse than a fast miss during a three-minute demo.
  */
 
+const axios = require('axios');
+const env = require('../config/env');
+const logger = require('../lib/logger');
+
 const client = axios.create({
   baseURL: env.intelServiceUrl,
   timeout: env.intelTimeoutMs,
   headers: { 'Content-Type': 'application/json' },
+  // A malicious or misconfigured service on this port should not be able to
+  // bounce us somewhere else, and a large response should not exhaust memory.
+  maxRedirects: 0,
+  maxContentLength: 32 * 1024 * 1024,
 });
 
-async function call(method, path, body, { timeout } = {}) {
+/**
+ * Circuit breaker.
+ *
+ * Without one, every request pays the full timeout while the service is down —
+ * `POST /api/complaints` would take 8 seconds instead of 200ms for as long as
+ * FastAPI is stopped, and the §T scene-2 budget of "under 3 seconds" would be
+ * missed by a service that is *correctly* being treated as optional. After a
+ * few consecutive failures the breaker opens and calls fail instantly with the
+ * last known reason. One probe is allowed through per cooldown to close it.
+ *
+ * Health checks bypass the breaker: their entire job is to report the true
+ * current state, and the admin page must show recovery the moment it happens.
+ */
+const breaker = {
+  failures: 0,
+  openedAt: 0,
+  reason: null,
+  isOpen() {
+    if (this.failures < env.intelBreakerThreshold) return false;
+    if (Date.now() - this.openedAt >= env.intelBreakerCooldownMs) return false; // half-open probe
+    return true;
+  },
+  recordSuccess() {
+    if (this.failures) logger.info('intel-service recovered — circuit closed');
+    this.failures = 0;
+    this.reason = null;
+  },
+  recordFailure(reason) {
+    this.failures += 1;
+    this.reason = reason;
+    if (this.failures === env.intelBreakerThreshold) {
+      this.openedAt = Date.now();
+      logger.warn({ reason, failures: this.failures }, 'intel-service circuit opened');
+    } else if (this.failures > env.intelBreakerThreshold) {
+      this.openedAt = Date.now();
+    }
+  },
+  state() {
+    return this.isOpen() ? 'open' : this.failures ? 'half-open' : 'closed';
+  },
+};
+
+async function call(method, path, body, { timeout, bypassBreaker = false } = {}) {
+  if (!bypassBreaker && breaker.isOpen()) {
+    return { ok: false, data: null, reason: `intel-service circuit open — ${breaker.reason}`, circuit: 'open' };
+  }
+
   try {
     const res = await client.request({ method, url: path, data: body, timeout });
-    return { ok: true, data: res.data };
+    breaker.recordSuccess();
+    return { ok: true, data: res.data, reason: null };
   } catch (err) {
     const reason =
-      err.code === 'ECONNABORTED' ? `intel-service timed out after ${timeout || env.intelTimeoutMs}ms`
-      : err.response ? `intel-service returned ${err.response.status}`
-      : 'intel-service unreachable';
-    return { ok: false, reason, data: null };
+      err.code === 'ECONNABORTED' || err.code === 'ETIMEDOUT'
+        ? `intel-service timed out after ${timeout || env.intelTimeoutMs}ms`
+        : err.response
+          ? `intel-service returned ${err.response.status}`
+          : `intel-service unreachable (${err.code || 'no response'})`;
+    breaker.recordFailure(reason);
+    return { ok: false, reason, data: null, circuit: breaker.state() };
   }
 }
 
@@ -47,17 +102,19 @@ const SERVICE_NAME = 'argus-intel';
  * reading of that situation.
  */
 async function health() {
-  const r = await call('get', '/health', null, { timeout: 2000 });
-  if (!r.ok) return r;
+  const r = await call('get', '/health', null, { timeout: 2000, bypassBreaker: true });
+  if (!r.ok) return { ...r, circuit: breaker.state() };
+
   if (r.data?.service !== SERVICE_NAME) {
-    return {
-      ok: false,
-      data: null,
-      reason: `something else is listening on ${env.intelServiceUrl} `
-        + `(reports "${r.data?.service ?? 'unknown'}", expected "${SERVICE_NAME}")`,
-    };
+    const reason =
+      `something else is listening on ${env.intelServiceUrl} ` +
+      `(reports "${r.data?.service ?? 'unknown'}", expected "${SERVICE_NAME}")`;
+    // A stranger on the port is a hard failure, not a transient one — trip the
+    // breaker so /extract never posts a complaint narrative to it.
+    breaker.recordFailure(reason);
+    return { ok: false, data: null, reason, circuit: breaker.state() };
   }
-  return r;
+  return { ...r, circuit: breaker.state() };
 }
 
 /** Extract entities from a complaint narrative. */
@@ -68,10 +125,10 @@ const extract = (narrative, complaintId) =>
 const ingest = (payload) => call('post', '/ingest', payload);
 
 /** Rebuild the whole graph from Postgres. Slow by nature — give it room. */
-const ingestBulk = (payload) => call('post', '/ingest/bulk', payload, { timeout: 120000 });
+const ingestBulk = (payload) => call('post', '/ingest/bulk', payload, { timeout: 120_000, bypassBreaker: true });
 
 /** Recompute communities, influence and risk. */
-const runAnalytics = () => call('post', '/analytics/run', null, { timeout: 60000 });
+const runAnalytics = () => call('post', '/analytics/run', null, { timeout: 60_000, bypassBreaker: true });
 
 const graphOverview = (limit = 150) => call('get', `/graph/overview?limit=${limit}`);
 const graphNeighbors = (nodeId, depth = 1, limit = 50) =>
@@ -81,4 +138,6 @@ const graphCluster = (clusterKey) => call('get', `/graph/cluster/${encodeURIComp
 module.exports = {
   health, extract, ingest, ingestBulk, runAnalytics,
   graphOverview, graphNeighbors, graphCluster,
+  circuitState: () => breaker.state(),
+  resetCircuit: () => { breaker.failures = 0; breaker.openedAt = 0; breaker.reason = null; },
 };

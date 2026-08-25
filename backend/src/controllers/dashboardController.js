@@ -1,5 +1,6 @@
 const pool = require('../db/pool');
 const intel = require('../services/intelClient');
+const { asyncHandler } = require('../lib/errors');
 
 /**
  * GET /api/dashboard/summary
@@ -29,8 +30,7 @@ function threatIndex({ clusterRisk, amountAtRisk, recentComplaints, openCritical
 
 const levelFor = (n) => (n >= 75 ? 'CRITICAL' : n >= 50 ? 'HIGH' : n >= 25 ? 'MEDIUM' : 'LOW');
 
-async function summary(req, res, next) {
-  try {
+const summary = asyncHandler(async (req, res) => {
     const [counts, clusters, recentComplaints, recentAlerts, topClusters] = await Promise.all([
       pool.query(`
         SELECT
@@ -97,7 +97,6 @@ async function summary(req, res, next) {
         intel_reason: intelHealth.ok ? null : intelHealth.reason,
       },
     });
-  } catch (err) { next(err); }
-}
+});
 
 module.exports = { summary, threatIndex, levelFor };
