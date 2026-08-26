@@ -1,0 +1,97 @@
+/**
+ * Routes.
+ *
+ * Pages that do not exist yet render a stub rather than being omitted, so the
+ * rail is navigable end to end from the first run — a dead link during a
+ * rehearsal is worse than an honest "not built yet", and it keeps the shell's
+ * layout verifiable before the pages land.
+ */
+
+import { lazy, Suspense } from 'react';
+import { Navigate, Route, Routes } from 'react-router-dom';
+
+import { useAuth } from '@/context/AuthContext';
+import Shell from '@/components/shell/Shell';
+import Login from '@/pages/Login';
+import Dashboard from '@/pages/Dashboard';
+import Complaints from '@/pages/Complaints';
+import ComplaintDetail from '@/pages/ComplaintDetail';
+import MoneyFlow from '@/pages/MoneyFlow';
+import ThreatFeed from '@/pages/ThreatFeed';
+import Timeline from '@/pages/Timeline';
+import EvidenceLocker from '@/pages/EvidenceLocker';
+import GeoIntelligence from '@/pages/GeoIntelligence';
+import Networks from '@/pages/Networks';
+import Admin from '@/pages/Admin';
+import { Spinner } from '@/components/ui/Bits';
+
+/**
+ * The Explorer is loaded on demand.
+ *
+ * Cytoscape and its layout engine are ~600 kB, and bundling them into the entry
+ * chunk means the LOGIN page downloads a graph library before anyone has
+ * authenticated. Splitting here keeps first paint light and pays the cost only
+ * when an investigator actually opens the network.
+ */
+const NetworkExplorer = lazy(() => import('@/pages/NetworkExplorer'));
+
+function PageLoading() {
+  return (
+    <div className="flex h-full items-center justify-center">
+      <Spinner size={16} />
+    </div>
+  );
+}
+
+function RequireAuth({ children }) {
+  const { user, loading } = useAuth();
+
+  // Wait for the token rehydration in AuthContext before deciding. Redirecting
+  // during the check would bounce a signed-in user to /login on every refresh.
+  if (loading) {
+    return (
+      <div className="flex h-dvh items-center justify-center bg-void">
+        <Spinner size={18} />
+      </div>
+    );
+  }
+  return user ? children : <Navigate to="/login" replace />;
+}
+
+export default function App() {
+  return (
+    <Routes>
+      <Route path="/login" element={<Login />} />
+
+      <Route
+        element={
+          <RequireAuth>
+            <Shell />
+          </RequireAuth>
+        }
+      >
+        <Route index element={<Dashboard />} />
+        <Route
+          path="network"
+          element={
+            <Suspense fallback={<PageLoading />}>
+              <NetworkExplorer />
+            </Suspense>
+          }
+        />
+        <Route path="complaints" element={<Complaints />} />
+        <Route path="complaints/:id" element={<ComplaintDetail />} />
+        <Route path="money" element={<MoneyFlow />} />
+        <Route path="geo" element={<GeoIntelligence />} />
+        <Route path="alerts" element={<ThreatFeed />} />
+        <Route path="timeline" element={<Timeline />} />
+        <Route path="clusters" element={<Networks />} />
+        <Route path="clusters/:key" element={<Networks />} />
+        <Route path="evidence" element={<EvidenceLocker />} />
+        <Route path="admin" element={<Admin />} />
+      </Route>
+
+      <Route path="*" element={<Navigate to="/" replace />} />
+    </Routes>
+  );
+}

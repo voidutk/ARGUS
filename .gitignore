@@ -57,3 +57,5 @@ Thumbs.db
 
 
 crime-in-india-datasets/
+# Screenshot output from frontend/scripts/shoot.mjs
+frontend/shots/

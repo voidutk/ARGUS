@@ -42,8 +42,23 @@ function loadAbi() {
   return JSON.parse(fs.readFileSync(file, 'utf8'));
 }
 
-/** Idempotent. Safe to call repeatedly; never throws. */
-async function init() {
+let initInFlight = null;
+
+/**
+ * Idempotent. Safe to call repeatedly; never throws.
+ *
+ * Single-flighted: `anchorEvidence` and `verifyOnChain` both re-init when the
+ * chain is not ready, so a batch of uploads arriving while the RPC is down
+ * would otherwise open a provider connection and probe the network once per
+ * exhibit. Sharing the in-flight promise means one probe serves all of them.
+ */
+function init() {
+  if (initInFlight) return initInFlight;
+  initInFlight = doInit().finally(() => { initInFlight = null; });
+  return initInFlight;
+}
+
+async function doInit() {
   const network = env.chainNetwork;
   try {
     const deployment = loadDeployment(network);
@@ -55,12 +70,12 @@ async function init() {
       return state;
     }
 
-    // The unlocked-account fallback below only makes sense against a local
-    // Hardhat node, which exposes signer 0 with no key needed. Against any
-    // other network (amoy, mainnet, ...) there is no unlocked account to get —
-    // attempting it would either throw an opaque RPC error or, worse on some
-    // providers, silently resolve to an address the caller does not control.
-    // Refuse explicitly instead of letting that ambiguity reach demo day.
+    // The unlocked-account fallback further down only makes sense against a
+    // local Hardhat node, which exposes signer 0 with no key needed. Against
+    // any other network (amoy, mainnet, ...) there is no unlocked account to
+    // get — attempting it would either throw an opaque RPC error or, worse on
+    // some providers, silently resolve to an address nobody controls. Refuse
+    // explicitly instead of letting that ambiguity reach demo day.
     const isLocalNetwork = network === 'localhost' || network === 'hardhat';
     if (!env.chainPrivateKey && !isLocalNetwork) {
       state = { ...state, ready: false, network,
@@ -68,11 +83,16 @@ async function init() {
       return state;
     }
 
+    // `provider` is the connection to whichever chain is configured — the local
+    // Hardhat node (http://127.0.0.1:8545) in dev, or the real Polygon Amoy
+    // testnet RPC on demo day. Everything below talks through this one object.
     const provider = new ethers.JsonRpcProvider(env.chainRpcUrl);
     // Fail fast rather than hanging the first upload on a dead RPC.
     const net = await Promise.race([
       provider.getNetwork(),
-      new Promise((_, rej) => setTimeout(() => rej(new Error('RPC timeout')), 4000)),
+      new Promise((_, rej) =>
+        setTimeout(() => rej(new Error(`RPC did not answer within ${env.chainProbeTimeoutMs}ms`)),
+          env.chainProbeTimeoutMs)),
     ]);
 
     let signer;
@@ -80,8 +100,7 @@ async function init() {
       signer = new ethers.Wallet(env.chainPrivateKey, provider);
     } else {
       // Local Hardhat exposes unlocked accounts; account 0 is the deployer,
-      // which already holds REGISTRAR_ROLE. isLocalNetwork guarantees this
-      // branch is only reached for localhost/hardhat.
+      // which already holds REGISTRAR_ROLE.
       signer = await provider.getSigner(0);
     }
 
@@ -145,6 +164,10 @@ async function anchorEvidence(evidenceId) {
   if (!ev) return { status: 'FAILED', error: 'evidence not found' };
 
   try {
+    // ev.sha256_hash is a 64-character hex string (32 bytes) — exactly what
+    // Solidity's `bytes32` type holds, once it has a `0x` in front. No other
+    // conversion happens; the digest going on-chain is bit-for-bit the same
+    // SHA-256 the frontend/API can display.
     const digest = hashService.toBytes32(ev.sha256_hash);
 
     // Registering the same digest twice reverts on-chain. If it is already
@@ -162,6 +185,9 @@ async function anchorEvidence(evidenceId) {
       return { status: 'ANCHORED', alreadyOnChain: true };
     }
 
+    // `tx` here is a PENDING transaction — the network has accepted it but it
+    // is not yet in a block. `tx.wait()` below is what actually pauses until a
+    // block includes it, which is the real "written permanently" moment.
     const tx = await state.contract.registerEvidence(
       digest,
       ev.complaint_id || 0,
@@ -249,6 +275,12 @@ async function getHistory(sha256Hex) {
       available: true,
       history: raw.map((v) => ({
         verifier: v.verifier,
+        // Solidity's block.timestamp is SECONDS since the epoch; JS Date wants
+        // MILLISECONDS. Missing this *1000 is a classic off-by-1000 bug that
+        // silently produces a date in 1970 instead of throwing, so it is easy
+        // to miss without a test — see the "event field naming" test block in
+        // EvidenceRegistry.test.js for the related ethers v6 gotcha this
+        // field's naming (checkedAt, not `at`) was designed around.
         checked_at: new Date(Number(v.checkedAt) * 1000).toISOString(),
         matched: v.matched,
         note: v.note,
@@ -268,11 +300,11 @@ const MAX_ANCHOR_RETRIES = 5;
 const RETRY_COOLDOWN = '2 minutes';
 
 /**
- * Requeue anchors that never made it to ANCHORED. Previously this only
- * happened if a human noticed a FAILED row and re-triggered it by hand — a
- * dead RPC during one upload meant that exhibit stayed unanchored forever.
- * Capped by retry_count and cooled down by last_attempt_at so a genuinely
- * broken chain does not turn into a tight retry loop.
+ * Requeues anchors that never made it to ANCHORED. Complements the manual
+ * per-exhibit POST /evidence/:id/anchor (evidenceController.reanchor): this
+ * sweep is what catches the exhibit nobody happened to notice was stuck, on a
+ * schedule instead of on request. Capped by retry_count and cooled down by
+ * last_attempt_at so a genuinely broken chain does not turn into a tight loop.
  */
 async function retryFailedAnchors() {
   const { rows } = await pool.query(

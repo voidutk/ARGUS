@@ -209,6 +209,44 @@ describe('EvidenceRegistry', function () {
     });
   });
 
+  describe('event field naming (ethers v6 Result/Array.prototype collision)', function () {
+    // Regression test: the Verification struct's timestamp is deliberately
+    // named `checkedAt` instead of `at` because ethers v6 decodes structs
+    // (and event args) into Result objects that inherit Array.prototype, so a
+    // field literally named `at` reads back as Array.prototype.at (a
+    // function) instead of the timestamp. The same collision was present in
+    // the EvidenceVerified/EvidenceSealed event signatures until this fix.
+    it('exposes the verification timestamp as checkedAt on EvidenceVerified, not `at`', async function () {
+      const digest = digestOf('event-field-check.png');
+      await registry.registerEvidence(digest, 1, 'DOCUMENT', 'CCPS-BLR');
+      const tx = await registry.logVerification(digest, true, 'intake check');
+      const receipt = await tx.wait();
+
+      const event = receipt.logs
+        .map((log) => { try { return registry.interface.parseLog(log); } catch { return null; } })
+        .find((e) => e && e.name === 'EvidenceVerified');
+
+      expect(event).to.not.equal(undefined);
+      expect(event.args.checkedAt).to.be.a('bigint');
+      expect(event.args.checkedAt).to.be.greaterThan(0n);
+    });
+
+    it('exposes the seal timestamp as sealedAt on EvidenceSealed, not `at`', async function () {
+      const digest = digestOf('seal-event-field-check.pdf');
+      await registry.registerEvidence(digest, 1, 'DOCUMENT', 'CCPS-BLR');
+      const tx = await registry.sealEvidence(digest, 'case closed');
+      const receipt = await tx.wait();
+
+      const event = receipt.logs
+        .map((log) => { try { return registry.interface.parseLog(log); } catch { return null; } })
+        .find((e) => e && e.name === 'EvidenceSealed');
+
+      expect(event).to.not.equal(undefined);
+      expect(event.args.sealedAt).to.be.a('bigint');
+      expect(event.args.sealedAt).to.be.greaterThan(0n);
+    });
+  });
+
   describe('enumeration', function () {
     it('lists every digest in registration order', async function () {
       const a = digestOf('a'); const b = digestOf('b');

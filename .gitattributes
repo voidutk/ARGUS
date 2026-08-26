@@ -1,0 +1,31 @@
+# Normalise line endings.
+#
+# Without this, Windows checkouts commit CRLF and macOS/Linux commit LF, so the
+# same file shows as a whole-file diff depending on who last touched it — which
+# buries real changes in review and makes `git blame` useless.
+#
+# `text=auto eol=lf` stores everything as LF in the repository while letting
+# each working copy use its native endings.
+* text=auto eol=lf
+
+# Windows-only scripts must keep CRLF or cmd.exe mis-parses them.
+*.bat  text eol=crlf
+*.cmd  text eol=crlf
+
+# Shell scripts must keep LF even on Windows, or bash fails on the \r.
+*.sh   text eol=lf
+
+# Binary — never touch these.
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.ico  binary
+*.pdf  binary
+*.woff binary
+*.woff2 binary
+
+# Generated. Collapsed in diffs and excluded from language stats, so a
+# lockfile change does not drown a review.
+package-lock.json  linguist-generated=true -diff
+*.json.abi         linguist-generated=true

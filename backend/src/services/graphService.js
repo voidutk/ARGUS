@@ -19,11 +19,15 @@
  */
 
 const pool = require('../db/pool');
-const { Graph, influenceScores } = require('./graphAlgos');
+const env = require('../config/env');
+const {
+  Graph, influenceScores, shortestPath, connectedComponents, bridgePathsThrough,
+} = require('./graphAlgos');
 
-const CACHE_TTL_MS = 60_000;
+const CACHE_TTL_MS = env.graphCacheTtlMs;
 let cache = null;
 let cachedAt = 0;
+let building = null;
 
 const entNodeId = (type, normalized) => `${String(type).toLowerCase()}:${normalized}`;
 const complaintNodeId = (id) => `complaint:${id}`;
@@ -140,11 +144,28 @@ async function build() {
   return { nodes, edges, g, byEntityId, clusters: clusters.rows, mastermindByCluster };
 }
 
+/**
+ * Loads the cached graph, building it at most once at a time.
+ *
+ * The single-flight guard is the point. Building costs a few hundred
+ * milliseconds of betweenness over the whole graph, and without it a cold cache
+ * plus five concurrent requests means five simultaneous builds — five full table
+ * reads and five Brandes runs racing to write the same cache. Sharing the
+ * in-flight promise means the first caller does the work and the rest await it.
+ */
 async function load({ force = false } = {}) {
   if (!force && cache && Date.now() - cachedAt < CACHE_TTL_MS) return cache;
-  cache = await build();
-  cachedAt = Date.now();
-  return cache;
+  if (building) return building;
+
+  building = build()
+    .then((built) => {
+      cache = built;
+      cachedAt = Date.now();
+      return built;
+    })
+    .finally(() => { building = null; });
+
+  return building;
 }
 
 function invalidate() { cache = null; cachedAt = 0; }
@@ -157,23 +178,97 @@ function inducedEdges(edges, keep) {
 /**
  * Opening view of the Network Explorer.
  *
- * Seeded with the highest-influence nodes rather than a random sample — an
- * investigator opening the page should land on the organisations, not on 150
- * unrelated one-off complaints. Everything else arrives by expansion.
+ * An investigator opening this page must land on the ORGANISATIONS. The
+ * previous implementation ranked every node by influence and took the top N,
+ * which sounds like the same thing and is not: it returned 150 nodes with 22
+ * edges between them, 125 of them isolated, and 119 of the 150 were complaints.
+ *
+ * Two things went wrong, and both are worth naming because they are easy to
+ * reintroduce:
+ *
+ *   1. Complaints dominate an influence ranking BY CONSTRUCTION. A complaint
+ *      node sits between the entities named in it, so it scores high on
+ *      betweenness — every complaint is a bridge. Ranking all node types
+ *      together therefore fills the view with complaint boxes and pushes out
+ *      the coordinators and infrastructure the page exists to show.
+ *
+ *   2. Top-N-by-score is not a connected subgraph. The highest-influence nodes
+ *      are spread across separate organisations, so inducing edges over them
+ *      yields almost none — a scatter plot, not a network.
+ *
+ * So the view is GROWN instead of sliced. Seed with the highest-influence
+ * ENTITIES, then expand outward along real edges, always taking the most
+ * influential unvisited neighbour next. The result is connected by
+ * construction, centred on the organisations, and complaints appear where they
+ * belong — hanging off the entities that link them, which is exactly the
+ * picture §T scene 3 describes.
  */
 async function overview({ limit = 150 } = {}) {
-  const { nodes, edges, clusters, mastermindByCluster } = await load();
-  const ranked = [...nodes.values()].sort((a, b) => b.influence - a.influence);
-  const keep = new Set(ranked.slice(0, limit).map((n2) => n2.id));
+  const { nodes, edges, g, clusters, mastermindByCluster } = await load();
 
-  const kept = ranked.filter((n2) => keep.has(n2.id));
+  const entities = [...nodes.values()]
+    .filter((n) => n.type !== 'COMPLAINT')
+    .sort((a, b) => b.influence - a.influence);
+
+  const keep = new Set();
+
+  /**
+   * One seed per cluster first, so no organisation is missing from the opening
+   * shot just because another one outranks it everywhere. Without this a single
+   * dominant cluster can consume the whole budget.
+   */
+  const seeds = [];
+  const seenCluster = new Set();
+  for (const node of entities) {
+    if (node.cluster && !seenCluster.has(node.cluster)) {
+      seenCluster.add(node.cluster);
+      seeds.push(node);
+    }
+  }
+  // Then the strongest remaining entities, whatever their cluster.
+  for (const node of entities) {
+    if (seeds.length >= 12) break;
+    if (!seeds.includes(node)) seeds.push(node);
+  }
+
+  // Breadth-first from every seed at once, always expanding the most
+  // influential frontier node next, so the budget is spent on structure rather
+  // than on whichever branch happened to be walked first.
+  const frontier = [];
+  const pushNode = (id) => {
+    if (keep.has(id) || keep.size >= limit) return;
+    keep.add(id);
+    frontier.push(id);
+  };
+  seeds.forEach((s) => pushNode(s.id));
+
+  while (frontier.length && keep.size < limit) {
+    frontier.sort((a, b) => (nodes.get(b)?.influence ?? 0) - (nodes.get(a)?.influence ?? 0));
+    const current = frontier.shift();
+    const neighbourIds = [...g.neighbors(current)]
+      .filter((id) => !keep.has(id))
+      .sort((a, b) => (nodes.get(b)?.influence ?? 0) - (nodes.get(a)?.influence ?? 0));
+    for (const id of neighbourIds) {
+      if (keep.size >= limit) break;
+      pushNode(id);
+    }
+  }
+
+  const kept = [...keep]
+    .map((id) => nodes.get(id))
+    .filter(Boolean)
+    .sort((a, b) => b.influence - a.influence);
+
+  const shownEdges = inducedEdges(edges, keep);
+
   return {
     nodes: kept,
-    edges: inducedEdges(edges, keep),
+    edges: shownEdges,
     stats: {
       total_nodes: nodes.size,
       total_edges: edges.length,
       shown_nodes: kept.length,
+      shown_edges: shownEdges.length,
       clusters: clusters.length,
       masterminds: [...mastermindByCluster.entries()].map(([k, v]) => ({ cluster: k, label: v.label, id: v.id })),
       source: 'postgres-fallback',
@@ -250,4 +345,194 @@ async function nodeIdForEntity(entityId) {
   return byEntityId.get(Number(entityId)) || null;
 }
 
-module.exports = { load, invalidate, overview, neighbors, cluster, nodeIdForEntity, entNodeId, complaintNodeId };
+/**
+ * "Why is this person flagged?" — docs/PLAN-V2-DATA-AND-INTEL.md §3.1.
+ *
+ * The hardest question a judge can ask about this system is "how do you know?",
+ * and a centrality score is not an answer to it. This assembles the four things
+ * that are:
+ *
+ *   bridge paths   — the concrete routes through this node, not the number that
+ *                    summarises them.
+ *   removal test   — what the organisation looks like with the node deleted.
+ *                    If it falls into three pieces, the node was holding it
+ *                    together, and that is a finding no score can convey.
+ *   rank           — where the node sits, in its cluster and graph-wide, so the
+ *                    claim is placed rather than asserted.
+ *   complaint count— usually zero for a coordinator, and the line that lands:
+ *                    the most important person in the network is the one no
+ *                    victim ever named.
+ *
+ * Everything here is derived at read time from the same cached graph the
+ * Explorer renders, so the explanation cannot drift from the picture.
+ */
+async function why(nodeId, { pathLimit = 8 } = {}) {
+  const { nodes, edges, g, clusters } = await load();
+  const node = nodes.get(nodeId);
+  if (!node) return null;
+
+  // --- bridge paths --------------------------------------------------------
+  const bridges = bridgePathsThrough(g, nodeId, { limit: pathLimit });
+  const describe = (id) => {
+    const n = nodes.get(id);
+    return n ? { id, label: n.label, type: n.type, cluster: n.cluster } : { id, label: id, type: 'UNKNOWN' };
+  };
+  const bridge_paths = bridges.map((b) => ({
+    from: describe(b.from),
+    via: describe(b.via),
+    to: describe(b.to),
+    severs: b.severs,
+    // The sentence an investigator reads, assembled here rather than in the UI
+    // so the API and the frontend cannot disagree about what was claimed.
+    narrative: `${describe(b.from).label} → [${node.label}] → ${describe(b.to).label}`,
+  }));
+
+  // --- removal test --------------------------------------------------------
+  //
+  // Scoped to the node's own cluster plus everything reachable from it, not the
+  // whole graph. Removing one node from a 1,200-node graph that already has
+  // several disconnected pieces would report a fragment count dominated by
+  // components that have nothing to do with this node.
+  const componentOf = connectedComponents(g).find((c) => c.has(nodeId));
+  const before = componentOf ? componentOf.size : 0;
+
+  const after = connectedComponents(g, { exclude: nodeId })
+    .filter((c) => componentOf && [...c].some((id) => componentOf.has(id)));
+
+  const fragments = after.length;
+  const largestAfter = after.reduce((max, c) => Math.max(max, c.size), 0);
+  const orphaned = after.filter((c) => c.size === 1).length;
+
+  // --- rank ----------------------------------------------------------------
+  const entityNodes = [...nodes.values()].filter((n) => n.type !== 'COMPLAINT');
+  const rankedGraph = entityNodes.slice().sort((a, b) => b.influence - a.influence);
+  const graphRank = rankedGraph.findIndex((n) => n.id === nodeId) + 1;
+
+  const clusterPeers = node.cluster
+    ? entityNodes.filter((n) => n.cluster === node.cluster).sort((a, b) => b.influence - a.influence)
+    : [];
+  const clusterRank = clusterPeers.findIndex((n) => n.id === nodeId) + 1;
+
+  // --- appearances ---------------------------------------------------------
+  const complaintEdges = edges.filter(
+    (e) => (e.source === nodeId || e.target === nodeId) && e.type === 'REPORTED_IN'
+  );
+  const clusterMeta = clusters.find((c) => c.cluster_key === node.cluster) || null;
+
+  return {
+    node: {
+      id: node.id, label: node.label, type: node.type, cluster: node.cluster,
+      influence: node.influence, pagerank: node.pagerank, betweenness: node.betweenness,
+      degree: node.degree, is_mastermind: node.is_mastermind, risk: node.risk,
+    },
+    cluster: clusterMeta
+      ? { cluster_key: clusterMeta.cluster_key, label: clusterMeta.label, risk_level: clusterMeta.risk_level }
+      : null,
+    bridge_paths,
+    bridge_pair_count: bridges.length,
+    severing_pair_count: bridges.filter((b) => b.severs).length,
+    removal_test: {
+      component_size_before: before,
+      fragments_after: fragments,
+      largest_fragment_after: largestAfter,
+      isolated_nodes_after: orphaned,
+      fragmenting: fragments > 1,
+      summary: fragments > 1
+        ? `Removing this node splits a ${before}-node network into ${fragments} fragments`
+        : `Removing this node leaves the network connected`,
+    },
+    rank: {
+      in_cluster: clusterRank || null,
+      cluster_size: clusterPeers.length || null,
+      graph_wide: graphRank || null,
+      graph_entities: entityNodes.length,
+    },
+    appearances: {
+      complaint_count: complaintEdges.length,
+      // The headline for a coordinator: named in nothing, central to everything.
+      never_named: complaintEdges.length === 0,
+    },
+    method: {
+      influence: 'Equal blend of PageRank and Brandes betweenness, both computed over the live graph.',
+      removal_test: 'Connected components recomputed with this node deleted.',
+      bridge_paths: 'Neighbour pairs with no direct edge, checked for an alternative route without this node.',
+    },
+  };
+}
+
+/**
+ * Shortest route between two nodes — docs/PLAN-V2-DATA-AND-INTEL.md §3.2.
+ *
+ * Returns the hydrated node objects and the edges along the path, so the
+ * Explorer can highlight the route it describes rather than re-deriving it.
+ */
+async function path(fromId, toId) {
+  const { nodes, edges, g } = await load();
+  if (!nodes.has(fromId)) return { error: 'unknown_from' };
+  if (!nodes.has(toId)) return { error: 'unknown_to' };
+
+  const ids = shortestPath(g, fromId, toId);
+  if (!ids) {
+    return {
+      found: false,
+      hops: null,
+      nodes: [nodes.get(fromId), nodes.get(toId)],
+      edges: [],
+      note: 'These two nodes are in separate components — no route connects them.',
+    };
+  }
+
+  const onPath = new Set(ids);
+  const pathEdges = [];
+  for (let i = 0; i < ids.length - 1; i++) {
+    const a = ids[i];
+    const b = ids[i + 1];
+    const edge = edges.find(
+      (e) => (e.source === a && e.target === b) || (e.source === b && e.target === a)
+    );
+    if (edge) pathEdges.push(edge);
+  }
+
+  return {
+    found: true,
+    hops: ids.length - 1,
+    node_ids: ids,
+    nodes: ids.map((id) => nodes.get(id)),
+    edges: pathEdges,
+    narrative: ids.map((id) => nodes.get(id)?.label ?? id).join(' → '),
+    // Present so the caller can style the subgraph without a second request.
+    highlight: [...onPath],
+  };
+}
+
+/**
+ * Neighbours two nodes have in common — docs/PLAN-V2-DATA-AND-INTEL.md §3.2.
+ *
+ * The investigator's version of "what do these two have in common": a shared
+ * mule account between two complaints is a lead; a shared cluster label is not.
+ */
+async function common(aId, bId) {
+  const { nodes, g } = await load();
+  if (!nodes.has(aId)) return { error: 'unknown_a' };
+  if (!nodes.has(bId)) return { error: 'unknown_b' };
+
+  const shared = [...g.neighbors(aId)]
+    .filter((id) => g.neighbors(bId).has(id))
+    .map((id) => nodes.get(id))
+    .filter(Boolean)
+    .sort((x, y) => y.influence - x.influence);
+
+  return {
+    a: nodes.get(aId),
+    b: nodes.get(bId),
+    shared,
+    count: shared.length,
+    directly_connected: g.neighbors(aId).has(bId),
+  };
+}
+
+module.exports = {
+  load, invalidate, overview, neighbors, cluster, nodeIdForEntity,
+  why, path, common,
+  entNodeId, complaintNodeId,
+};

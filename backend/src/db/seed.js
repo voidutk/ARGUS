@@ -734,33 +734,20 @@ async function persistCasesAndAlerts(client, ids, clusterIds) {
     );
   }
 
-  const A = plant.ALPHA;
-  const alerts = [
-    ['CRITICAL', 'MASTERMIND_IDENTIFIED', `Coordinator identified in Cluster ALPHA — ${A.mastermindName}`,
-      { cluster: 'ALPHA', basis: 'betweenness + pagerank', direct_victim_contact: 0 }, 'ALPHA', A.mastermindKey],
-    ['CRITICAL', 'WALLET_REUSE', 'Wallet reused across 14 complaints in 6 states',
-      { complaints: 14, states: 6 }, 'ALPHA', A.walletKeys[0]],
-    ['HIGH', 'DEVICE_REUSE', 'Device fingerprint seen in 11 complaints across 4 states',
-      { complaints: 11, states: 4 }, 'ALPHA', null],
-    ['HIGH', 'IP_CLUSTER', 'Same VoIP gateway used in 14 digital-arrest complaints',
-      { complaints: 14, rail: 'VoIP' }, 'BETA', null],
-    ['HIGH', 'LAYERING_DETECTED', 'Five-hop laundering chain terminating at offshore exchange',
-      { hops: 5, terminal: 'EXCHANGE' }, 'GAMMA', null],
-    ['MEDIUM', 'HANDLE_MATCH', 'Telegram handle @vikram_invest_pro matches a previous investigation',
-      { handle: '@vikram_invest_pro' }, 'ALPHA', null],
-    ['MEDIUM', 'ACCOUNT_VELOCITY', 'Mule account received 9 transfers within 48 hours',
-      { transfers: 9, window_hours: 48 }, 'BETA', null],
-    ['LOW', 'NEW_COMPLAINT_LINKED', 'New complaint auto-linked to an existing cluster',
-      { cluster: 'ALPHA' }, 'ALPHA', null],
-  ];
-  for (const [severity, type, title, details, ck, entKey] of alerts) {
-    await client.query(
-      `INSERT INTO alerts (severity, alert_type, title, details, cluster_id, entity_id)
-       VALUES ($1,$2,$3,$4,$5,$6)`,
-      [severity, type, title, JSON.stringify(details), clusterIds[ck] || null,
-       entKey ? ids.entityIds.get(entKey) : null]
-    );
-  }
+  /**
+   * No alerts are seeded.
+   *
+   * They used to be: eight hand-written rows saying things like "Wallet reused
+   * across 14 complaints in 6 states" — numbers computed from nothing, which
+   * would have gone on saying 14 and 6 however the data changed. That is a mock
+   * wearing the costume of a feature, and docs/PLAN-V2-DATA-AND-INTEL.md §3.3
+   * says to replace it.
+   *
+   * The threat feed is now produced by src/services/alertRules.js, which runs
+   * five rules over the live tables and stores the query behind each finding.
+   * `npm run setup` runs it after seeding; `POST /api/alerts/regenerate`
+   * re-runs it on demand.
+   */
 
   // Audit trail — this is what the Investigation Timeline page renders.
   const events = [
@@ -816,6 +803,24 @@ async function main() {
     const ids = await persist(client);
     const clusterIds = await persistClusters(client, ids);
     await persistCasesAndAlerts(client, ids, clusterIds);
+
+    /**
+     * Re-point the reference sequence past everything just seeded.
+     *
+     * `TRUNCATE ... RESTART IDENTITY` resets the tables' own identity columns
+     * but NOT `complaint_ref_seq`, which is a standalone sequence the intake
+     * controller draws from. Without this, a freshly seeded database holds
+     * refs up to NCRP-YYYY-000220 while the sequence still sits at 1 — and the
+     * first complaint filed in the demo collides with a seeded one and dies on
+     * the UNIQUE constraint. Seeded and live refs share one numbering line, so
+     * the seed has to hand it over correctly.
+     */
+    await client.query(
+      `SELECT setval('complaint_ref_seq', GREATEST(
+         (SELECT COALESCE(MAX(substring(complaint_ref FROM '(\\d+)$')::bigint), 0)
+            FROM complaints WHERE complaint_ref ~ '^NCRP-\\d{4}-\\d+$'),
+         1))`
+    );
 
     await client.query('COMMIT');
     console.log('Seed committed.\n');

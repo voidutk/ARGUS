@@ -3,7 +3,7 @@
   "chainId": 31337,
   "address": "0x5FbDB2315678afecb367f032d93F642f64180aa3",
   "deployer": "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
-  "txHash": "0x197378959fa955e0053d8078b50b539bb07fbcdece13d108049d8e2b808dc710",
+  "txHash": "0x5f5e7deb9b822a54fa096615d8011f4b00a877d86a6c3a5e112b0fd9a488055c",
   "blockNumber": 1,
-  "deployedAt": "2026-08-23T15:14:29.060Z"
+  "deployedAt": "2026-08-25T09:21:48.129Z"
 }
