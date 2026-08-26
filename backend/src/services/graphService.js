@@ -661,8 +661,66 @@ async function persistScores() {
   };
 }
 
+/**
+ * The corpus, shaped for the Neo4j projection.
+ *
+ * `POST /api/graph/rebuild` used to call `intel.ingestBulk({ source:
+ * 'postgres' })` — a payload with no `complaints` array at all. The intel
+ * service dutifully iterated an empty list and returned `{ingested: 0}`, the
+ * endpoint reported success, and Neo4j held only the handful of complaints
+ * filed live since the container started: 19 nodes against 1,074 entities in
+ * Postgres. Admin showed "Neo4j UP · connected" the whole time, because it was
+ * connected. It was just empty.
+ *
+ * Returned as data rather than pushed from here so the caller decides how to
+ * chunk and where the HTTP call happens — the same reader serves the admin
+ * endpoint and the setup-time CLI script, which has no token to authenticate
+ * with.
+ *
+ * One query, not one per complaint. Two hundred and twenty round trips to build
+ * a projection is the kind of thing that works on a laptop and times out on a
+ * demo machine.
+ */
+async function projectionCorpus() {
+  const { rows } = await pool.query(`
+    SELECT c.id, c.complaint_ref, c.scam_category, c.amount_inr::float AS amount_inr,
+           c.state, c.district, c.filed_at,
+           COALESCE(
+             json_agg(
+               json_build_object(
+                 'id', e.id,
+                 'entity_type', e.entity_type,
+                 'value', e.value,
+                 'normalized_value', e.normalized_value,
+                 'role', ce.role,
+                 'confidence', ce.confidence,
+                 'method', ce.method
+               ) ORDER BY e.id
+             ) FILTER (WHERE e.id IS NOT NULL),
+             '[]'
+           ) AS entities
+      FROM complaints c
+      LEFT JOIN complaint_entities ce ON ce.complaint_id = c.id
+      LEFT JOIN entities e ON e.id = ce.entity_id
+     GROUP BY c.id
+     ORDER BY c.id`);
+
+  return rows.map((r) => ({
+    complaint: {
+      id: r.id,
+      complaint_ref: r.complaint_ref,
+      scam_category: r.scam_category,
+      amount_inr: r.amount_inr,
+      state: r.state,
+      district: r.district,
+      filed_at: r.filed_at,
+    },
+    entities: r.entities,
+  }));
+}
+
 module.exports = {
   load, invalidate, overview, neighbors, cluster, nodeIdForEntity,
-  why, path, common, persistScores, RISK_WEIGHTS,
+  why, path, common, persistScores, projectionCorpus, RISK_WEIGHTS,
   entNodeId, complaintNodeId,
 };

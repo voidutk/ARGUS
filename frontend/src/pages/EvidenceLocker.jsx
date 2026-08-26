@@ -197,8 +197,32 @@ function CustodyTrail({ evidenceId }) {
     return <Empty title="Not yet verified" hint="Run a verification to write the first custody entry." />;
   }
 
+  /**
+   * The chain can hold MORE checks than this database knows about.
+   *
+   * `verifications` is truncated by a re-seed; the registry is not. So after a
+   * database reset the trail legitimately shows checks with no local row behind
+   * them, and the exhibit list — which counts local rows — reads a smaller
+   * number than the trail beside it.
+   *
+   * Which is the argument for anchoring, demonstrating itself: a record that
+   * survives the operator wiping their own database is the only kind that is
+   * worth anything in a custody dispute. Saying so is better than quietly
+   * reconciling the two numbers, and far better than leaving them to disagree
+   * unexplained.
+   */
+  const orphaned = data.on_chain.length - (data.local?.length ?? 0);
+
   return (
     <ol className="flex flex-col">
+      {orphaned > 0 && (
+        <li className="border-b border-hair px-3 py-2 text-[10.5px] leading-relaxed text-faint">
+          {orphaned} of these {data.on_chain.length} checks {orphaned === 1 ? 'has' : 'have'} no
+          matching row in this database — {orphaned === 1 ? 'it predates' : 'they predate'} the last
+          reset. The registry kept {orphaned === 1 ? 'it' : 'them'} anyway, which is the point of
+          putting the custody trail somewhere the operator cannot edit.
+        </li>
+      )}
       {data.on_chain.map((v, i) => (
         <li
           key={i}

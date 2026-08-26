@@ -558,37 +558,58 @@ async function seal(ex) {
 }
 
 /**
- * Backfill the custody trail.
+ * Write the custody trail — to the chain as well as to Postgres.
  *
- * These rows record checks that were performed against digests which are real
- * and anchors which are real, so `is_valid` is computed, never asserted — the
- * stored digest is compared to the chain the same way the live verify does.
- * A demo that hard-codes `is_valid = true` is claiming an integrity check it
- * never ran.
+ * The panel this feeds is titled "Chain of custody — every check, permanently",
+ * and it renders the ON-CHAIN history, because that is the record the claim
+ * rests on. Writing only Postgres rows here produced exactly the contradiction
+ * you would expect: the exhibit list counted "2 checks" from the local table
+ * while the trail beside it showed one, because the other check had never
+ * happened anywhere a verifier could see it.
+ *
+ * So each backfilled check does what the live verify endpoint does — recompute
+ * the digest, compare it against the registry, and log the outcome on-chain —
+ * and `is_valid` is the result of that comparison rather than a value typed in.
+ * A seeded custody trail that asserts its own integrity is not evidence of
+ * anything.
+ *
+ * The on-chain timestamp is the block's, so it reads as today rather than as
+ * the backdated `verified_at`. That is a property of the chain and not
+ * something to paper over: you cannot backdate a block, which is most of why
+ * anchoring is worth doing.
  */
-async function backfillVerifications(evidenceId, count, ageDays) {
+async function recordVerifications(evidenceId, count, ageDays) {
   if (!count) return 0;
 
   const { rows } = await pool.query(
     `SELECT sha256_hash FROM evidence WHERE id = $1`, [evidenceId]
   );
   const digest = rows[0].sha256_hash;
-  const onChain = await chain.verifyOnChain(digest);
-  const chainHash = onChain.exists ? digest : null;
-  const isValid = Boolean(onChain.exists);
 
   // Checkers rotate across the two investigators and the supervisor: repeat
   // verification by a different officer is the point of a custody trail.
   const CHECKERS = [3, 5, 2, 4];
+  let written = 0;
+
   for (let i = 0; i < count; i++) {
+    const onChain = await chain.verifyOnChain(digest);
+    const isValid = Boolean(onChain.exists);
+    const note = isValid ? 'integrity confirmed' : 'digest not found on chain';
+
+    const logged = isValid
+      ? await chain.logVerification(digest, true, note)
+      : { ok: false };
+
     const daysAfter = Math.max(0, ageDays - (i + 1) * 2);
     await pool.query(
-      `INSERT INTO verifications (evidence_id, verified_by, computed_hash, chain_hash, is_valid, verified_at)
-       VALUES ($1,$2,$3,$4,$5, now() - ($6 || ' days')::interval)`,
-      [evidenceId, CHECKERS[i % CHECKERS.length], digest, chainHash, isValid, String(daysAfter)]
+      `INSERT INTO verifications (evidence_id, verified_by, computed_hash, chain_hash, is_valid, tx_hash, verified_at)
+       VALUES ($1,$2,$3,$4,$5,$6, now() - ($7 || ' days')::interval)`,
+      [evidenceId, CHECKERS[i % CHECKERS.length], digest, isValid ? digest : null,
+        isValid, logged.txHash || null, String(daysAfter)]
     );
+    written++;
   }
-  return count;
+  return written;
 }
 
 async function run() {
@@ -616,7 +637,7 @@ async function run() {
   let checks = 0;
   for (const ex of EXHIBITS) {
     const r = await seal(ex);
-    const n = await backfillVerifications(r.id, ex.verifications, ex.ageDays);
+    const n = await recordVerifications(r.id, ex.verifications, ex.ageDays);
     checks += n;
     if (r.anchor === 'ANCHORED') anchored++;
     const badge = r.anchor === 'ANCHORED' ? 'anchored' : r.anchor.toLowerCase();

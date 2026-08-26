@@ -16,7 +16,7 @@
     "load-reference": "node scripts/load-reference-data.js",
     "load-reference:dry": "node scripts/load-reference-data.js --dry-run --verbose",
     "generate-alerts": "node scripts/generate-alerts.js",
-    "setup": "npm run migrate && npm run seed && npm run load-reference && npm run compute-scores && npm run generate-alerts && npm run seed:evidence",
+    "setup": "npm run migrate && npm run seed && npm run load-reference && npm run compute-scores && npm run generate-alerts && npm run seed:evidence && npm run project-neo4j",
     "test:unit": "node --test \"test/*.test.js\"",
     "verify-determinism": "node scripts/verify-determinism.js",
     "verify-plant": "node scripts/verify-plant.js",
@@ -26,7 +26,8 @@
     "verify-all": "npm run test:unit && npm run verify-determinism && npm run verify-plant && npm run smoke && npm run smoke-v2 && npm run evidence-e2e",
     "seed:evidence": "node src/db/seedEvidence.js",
     "compute-scores": "node scripts/compute-scores.js",
-    "verify-extraction": "node scripts/verify-extraction.js"
+    "verify-extraction": "node scripts/verify-extraction.js",
+    "project-neo4j": "node scripts/project-neo4j.js"
   },
   "dependencies": {
     "axios": "^1.7.9",

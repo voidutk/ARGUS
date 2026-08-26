@@ -107,29 +107,57 @@ const common = asyncHandler(async (req, res) => {
   res.json({ ...result, source: 'postgres' });
 });
 
-/** ADMIN only. Rebuilds Neo4j from Postgres and drops the local cache. */
+/**
+ * ADMIN only. Rebuilds Neo4j from Postgres and drops the local cache.
+ *
+ * Sends the corpus in chunks. A single body carrying 220 complaints and their
+ * ~1,300 entity links is a few megabytes and one all-or-nothing HTTP call;
+ * chunking keeps each request small and means a mid-run failure leaves a
+ * partially rebuilt projection rather than nothing. That is the same tradeoff
+ * the intel service already makes per-complaint, for the same reason.
+ */
+const REBUILD_CHUNK = 40;
+
 const rebuild = asyncHandler(async (req, res) => {
   graph.invalidate();
-  const live = await intel.ingestBulk({ source: 'postgres' });
+
+  const corpus = await graph.projectionCorpus();
+  const totals = { ingested: 0, nodes: 0, edges: 0, failed: 0 };
+  let failure = null;
+
+  for (let i = 0; i < corpus.length; i += REBUILD_CHUNK) {
+    const chunk = corpus.slice(i, i + REBUILD_CHUNK);
+    const live = await intel.ingestBulk({ source: 'postgres', complaints: chunk });
+
+    if (!live.ok) { failure = live.reason; break; }
+    totals.ingested += live.data.ingested ?? 0;
+    totals.nodes += live.data.nodes ?? 0;
+    totals.edges += live.data.edges ?? 0;
+    totals.failed += live.data.failed ?? 0;
+  }
 
   await audit.log({
     actorId: req.user.id,
     action: 'GRAPH_REBUILD',
     entityType: 'graph',
-    metadata: { intel_ok: live.ok, reason: live.reason || null },
+    metadata: { intel_ok: !failure, ingested: totals.ingested, reason: failure },
     ipAddress: audit.clientIp(req),
   });
 
-  if (!live.ok) {
+  if (failure) {
     // The local cache was still dropped, so the fallback graph is fresh. 202
     // rather than 500: the part of the job we own succeeded.
     return res.status(202).json({
       rebuilt: 'postgres-fallback-only',
-      reason: live.reason,
-      note: 'Local graph cache cleared. Neo4j was not reachable.',
+      reason: failure,
+      partial: totals,
+      note: totals.ingested
+        ? `Neo4j went away after ${totals.ingested} complaints. Local graph cache cleared.`
+        : 'Local graph cache cleared. Neo4j was not reachable.',
     });
   }
-  res.json({ ...live.data, source: 'intel-service' });
+
+  res.json({ ...totals, complaints: corpus.length, source: 'intel-service' });
 });
 
 module.exports = { overview, neighbors, cluster, why, path, common, rebuild };
