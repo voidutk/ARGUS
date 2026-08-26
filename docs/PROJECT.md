@@ -589,7 +589,38 @@ cd ../frontend
 cp .env.example .env
 npm install
 npm run dev                      # → :5173
+
+# 6. Finish the dataset — RUN THIS LAST
+cd ../backend
+npm run setup
 ```
+
+**Why step 6 comes last.** `npm run migrate && npm run seed` in step 2 gets the
+API up, and no further. A seeded database is not yet a demo-ready one: every
+entity's `influence_score` and `risk_score` sit at 0 until analytics runs, the
+threat feed is empty until the rules run, the Evidence Locker has nothing in it,
+and Neo4j holds nothing. `npm run setup` is the whole cold start in order —
+
+| step | what it does | needs |
+|---|---|---|
+| `migrate` | schema + checksums | Postgres |
+| `seed` | the planted corpus | Postgres |
+| `load-reference` | 31,360 NCRB rows | Postgres |
+| `compute-scores` | influence + risk, written back | Postgres |
+| `generate-alerts` | the five rules → threat feed | Postgres |
+| `seed:evidence` | 12 exhibits, hashed, encrypted, anchored | Hardhat node |
+| `project-neo4j` | the graph projection | intel-service |
+
+— and the last two are why it runs after steps 3 and 4 rather than inside step
+2. Both degrade gracefully if their service is down (exhibits stay `PENDING`,
+the projection is skipped with a message) rather than failing the run, so a
+partial stack still gets you a working app; you just have to re-run them once
+the missing service is up.
+
+Anything that re-seeds resets all of it. `npm run verify-determinism` re-seeds
+twice, so it ends by telling you to run `compute-scores` and `seed:evidence`
+again — a database showing "influence 0" and an empty locker is almost always
+this, not a bug.
 
 ### Demo accounts (seeded)
 
