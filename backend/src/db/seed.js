@@ -114,8 +114,34 @@ function elink(from, to, rel, { weight = 1, source = 'INTEL', note = null } = {}
 let refCounter = 4000;
 const nextRef = () => `NCRP-2026-${String(++refCounter).padStart(6, '0')}`;
 
+/**
+ * The timeline anchor: the instant this seed run started.
+ *
+ * This used to be the literal date the seed was written, `2026-04-20`. Every
+ * rehearsal after that date drifted further from it, and by four months out the
+ * Dashboard opened on "RECENT INTAKE — 0 today · 0 in 30 days" with every
+ * complaint stamped "4 months ago". A national monitoring platform whose
+ * headline is that nothing has been reported since spring reads as switched
+ * off, and no amount of correct data underneath fixes that first impression.
+ *
+ * Anchoring to the current day keeps the corpus arriving continuously. It does
+ * not weaken the determinism guarantee, which is about CONTENT: the hash in
+ * verify-determinism covers narratives, entities, links, amounts and refs, and
+ * deliberately includes no timestamp column. Two runs on the same day are
+ * identical in every respect; across days only the dates slide, which is the
+ * behaviour a demo dataset should have.
+ *
+ * Captured ONCE, at the moment the seed starts, and every date is measured back
+ * from it. Two things follow from that. Every row in a single run shares one
+ * frame of reference, so a complaint and the transactions beneath it cannot
+ * disagree about when "now" was. And nothing is ever stamped in the future —
+ * which an anchor pinned to a fixed hour of the current day would do whenever
+ * the seed ran earlier in the morning than that hour.
+ */
+const TIMELINE_ANCHOR = Date.now();
+
 function daysAgo(d, hourSpread = true) {
-  const t = new Date('2026-04-20T09:00:00Z').getTime() - d * 86400000;
+  const t = TIMELINE_ANCHOR - d * 86400000;
   return new Date(t - (hourSpread ? int(0, 82800000) : 0)).toISOString();
 }
 
@@ -135,23 +161,74 @@ function makeComplaint({ category, place, handlerPhoneKey, handlerName, upiKey, 
   const amt2 = amount();
   const total = amt1 + amt2;
 
+  /**
+   * Filler identifiers.
+   *
+   * A narrative template names a wallet, an account and an IP whether or not
+   * the caller supplied one — a crypto-fraud story without a wallet address is
+   * not a crypto-fraud story. When the caller passes null, a throwaway value
+   * used to be interpolated straight into the text and then forgotten, and the
+   * result was visible on the complaint page: a 42-character wallet address
+   * sitting in the narrative unhighlighted, absent from the extracted-entity
+   * list, with the header counting "3 of 6 quoted in the narrative". The one
+   * claim this product makes above all others is that it reads what victims
+   * write, and that address was a standing counter-example on screen.
+   *
+   * So filler values are registered as entities too — but only the ones that
+   * actually reach the text, which is why registration happens after the
+   * template runs rather than before. Registering a wallet for a template that
+   * never mentions one would be the mirror-image error: an entity linked to a
+   * complaint it appears nowhere in.
+   *
+   * Filler identifiers are freshly generated per complaint, so they arrive as
+   * leaf nodes and cannot manufacture a correlation between two complaints.
+   * The telegram handle is the exception that proves the rule: it used to
+   * default to a single shared literal, and registering THAT would have wired
+   * every unclustered noise complaint to one node and handed the clustering a
+   * gang that does not exist. It gets a unique handle instead.
+   */
+  const filler = {
+    account: accountKey ? entities.get(accountKey).normalized : accountNo(),
+    wallet: walletKey ? entities.get(walletKey).value : ethWallet(),
+    ip: ipKey ? entities.get(ipKey).normalized : ipv4(),
+    telegram: telegramHandle || `${pick(D.FIRST_NAMES).toLowerCase()}_trades${int(10, 99)}`,
+  };
+
   const tpl = pick(D.NARRATIVES[category] || D.NARRATIVES.UPI_FRAUD);
   const narrative = tpl({
     handlerName: handlerName || personName(),
     handlerPhone: rnd() < 0.35 ? `+91 ${entities.get(handlerPhoneKey).normalized}` : entities.get(handlerPhoneKey).normalized,
     upi: rnd() < 0.25 ? entities.get(upiKey).normalized.toUpperCase() : entities.get(upiKey).normalized,
-    account: accountKey ? entities.get(accountKey).normalized : accountNo(),
+    account: filler.account,
     bank: bankName || pick(D.BANKS)[0],
     ifsc: ifscCode || ifsc(pick(D.BANKS)[1]),
-    wallet: walletKey ? entities.get(walletKey).value : ethWallet(),
-    telegram: telegramHandle || 'trader_pro_x',
+    wallet: filler.wallet,
+    telegram: filler.telegram,
     email: victimEmail,
-    ip: ipKey ? entities.get(ipKey).normalized : ipv4(),
+    ip: filler.ip,
     groupName: pick(D.TELEGRAM_GROUP_NAMES),
     amt1: amt1.toLocaleString('en-IN'),
     amt2: amt2.toLocaleString('en-IN'),
     total: total.toLocaleString('en-IN'),
   });
+
+  // Adopt any filler the narrative actually quoted.
+  if (!accountKey && narrative.includes(filler.account)) {
+    accountKey = ent('BANK_ACCOUNT', filler.account);
+  }
+  if (!walletKey && narrative.includes(filler.wallet)) {
+    walletKey = ent('WALLET', filler.wallet);
+  }
+  if (!ipKey && narrative.includes(filler.ip)) {
+    ipKey = ent('IP', filler.ip);
+  }
+  // Only the GENERATED handle is adopted here. When a caller passed one it
+  // belongs to a planted cell, and that cell links its own telegram entity to
+  // the complaint itself — adopting it again would write the same
+  // (complaint, entity, role) row twice.
+  const narrativeTelegramKey = !telegramHandle && narrative.includes(filler.telegram)
+    ? ent('TELEGRAM', `@${filler.telegram}`)
+    : null;
 
   const ci = complaints.length;
   complaints.push({
@@ -189,6 +266,7 @@ function makeComplaint({ category, place, handlerPhoneKey, handlerName, upiKey, 
   link(ci, upiKey, 'SUSPECT');
   if (accountKey) link(ci, accountKey, 'SUSPECT');
   if (walletKey) link(ci, walletKey, 'SUSPECT');
+  if (narrativeTelegramKey) link(ci, narrativeTelegramKey, 'SUSPECT', 'REGEX', 0.92);
   if (deviceKey) link(ci, deviceKey, 'SUSPECT', 'MANUAL', 0.88);
   if (ipKey) link(ci, ipKey, 'SUSPECT', 'REGEX', 0.92);
 
@@ -290,6 +368,28 @@ function buildAlpha() {
   const places = shuffle(D.PLACES).slice(0, 14);
   const built = [];
 
+  /**
+   * The harvest window.
+   *
+   * Investment rings do not collect at a steady trickle. They manufacture a
+   * deadline — the allotment closes tonight, the pre-IPO window shuts at
+   * midnight — and push every victim who is far enough along to pay at once.
+   * Roughly two in five of these complaints are victims of one such night.
+   *
+   * The detail that makes it worth planting: those victims all TRANSFERRED
+   * within hours of each other, and then reported over the following weeks as
+   * each one separately worked out what had happened. So the burst exists in
+   * transaction time and is completely invisible in filing time. An analyst
+   * sorting complaints by `filed_at` sees eighteen unrelated cases spread over
+   * two months; the velocity rule, which reads `occurred_at`, sees one night.
+   *
+   * This is the same lesson that killed the IMPOSSIBLE_TRAVEL rule earlier —
+   * when a victim reported is not when anything happened — turned around and
+   * used deliberately.
+   */
+  const HARVEST_DAYS_AGO = 61;
+  const isHarvest = (i) => i % 7 < 3;             // 18 of 42, ~6 per cell
+
   for (let i = 0; i < 42; i++) {
     const cell = cells[i % 3];
     const k = Math.floor(i / 3);                  // 0..13 within the cell
@@ -308,16 +408,23 @@ function buildAlpha() {
       telegramHandle: cell.tgHandle,
       deviceKey: null,
       ipKey: null,
-      filedDaysAgo: int(1, 95),
+      // A harvest victim must file AFTER the night they paid, so their filing
+      // window stops short of it. Everyone else is spread across the corpus.
+      filedDaysAgo: isHarvest(i) ? int(2, HARVEST_DAYS_AGO - 4) : int(1, 95),
       clusterTag: 'ALPHA',
     });
     link(r.ci, cell.telegram, 'SUSPECT', 'REGEX', 0.93);
-    built.push({ ...r, cell, mule });
+    built.push({ ...r, cell, mule, harvest: isHarvest(i) });
   }
 
   // Money stays inside the cell: victim -> rotated mule -> that cell's wallet.
   built.forEach((r) => {
-    const at = complaints[r.ci].filedAt;
+    // Harvest victims paid inside one ~19-hour window; everyone else paid on
+    // their own timeline, which the ladder anchors to their filing date.
+    const at = r.harvest
+      ? new Date(Date.parse(daysAgo(HARVEST_DAYS_AGO, false)) + int(0, 19 * 36e5)).toISOString()
+      : complaints[r.ci].filedAt;
+
     txns.push({ ci: r.ci, from: r.victimPhoneKey, to: r.mule.key, amount: r.amt2, rail: 'IMPS', hop: 0, ref: utr(), at });
     txns.push({ ci: r.ci, from: r.mule.key, to: r.cell.wallet, amount: Math.round(r.amt2 * 0.94), rail: 'CRYPTO', hop: 1, ref: txHash(), at });
   });
@@ -388,7 +495,7 @@ function buildBeta() {
       ifscCode: account.ifscCode,
       deviceKey: null,
       ipKey: crew.voip,
-      filedDaysAgo: int(1, 70),
+      filedDaysAgo: int(0, 70),
       clusterTag: 'BETA',
     });
     built.push({ ...r, account });
@@ -489,6 +596,55 @@ function buildGamma() {
     txns.push({ ci: r.ci, from: c.mixer, to: c.exchange, amount: Math.round(a * 0.85), rail: 'CRYPTO', hop: 5, ref: txHash(), at });
   });
 
+  /**
+   * The return leg — round-tripping.
+   *
+   * Every ladder above runs one way, victim to exchange, and that made the
+   * CIRCULAR_FLOW rule permanently silent: it walks the transaction graph
+   * looking for money that comes back to where it started, and a strictly
+   * linear corpus contains no such path. The rule was correct and had nothing
+   * to find, which is the worst kind of green light — a detector that cannot
+   * fire looks identical to a detector that found nothing wrong.
+   *
+   * So the pattern it detects is planted, because it is a real one. Round-
+   * tripping is standard layering practice: a slice of the laundered funds is
+   * cycled back out of the mixer into the domestic banking layer it came from,
+   * where it re-enters as apparently unrelated inflow and is layered again.
+   * The loop it creates — layer1 → layer2 → hot → mixer → layer1 — is exactly
+   * what makes it detectable, and exactly why launderers keep the slice small.
+   *
+   * Kept to one return leg per cell rather than one per complaint: this is a
+   * periodic consolidation move, not something that happens to each victim's
+   * money separately. `complaint_id` is null for the same reason — no single
+   * complainant's money is being returned, so attributing it to one would be a
+   * claim the data does not support.
+   */
+  cells.forEach((c, i) => {
+    const cellComplaints = built.filter((r) => r.cell === c);
+    if (!cellComplaints.length) return;
+
+    // Sized off the cell's own throughput so the leg is proportionate, and
+    // dated after the ladders that fund it.
+    const pool = cellComplaints.reduce((sum, r) => sum + r.amt2, 0);
+    const returned = Math.round(pool * 0.18);
+    // `filedAt` is an ISO string (see daysAgo), not a Date — parse before maths.
+    const at = new Date(
+      Math.max(...cellComplaints.map((r) => Date.parse(complaints[r.ci].filedAt))) + 36e5 * 30
+    ).toISOString();
+
+    txns.push({
+      ci: null,
+      from: c.mixer,
+      to: c.layer1,
+      amount: returned,
+      rail: 'CRYPTO',
+      hop: 6,
+      ref: txHash(),
+      at,
+      note: `round-trip back into layering ${i + 1}A`,
+    });
+  });
+
   plant.GAMMA = {
     label: 'Crypto laundering — twin ladders to offshore exchanges',
     mastermindKey: boss,
@@ -518,7 +674,7 @@ function buildNoise(n) {
       walletKey: rnd() < 0.12 ? ent('WALLET', ethWallet()) : null,
       deviceKey: rnd() < 0.15 ? ent('DEVICE', deviceFp()) : null,
       ipKey: rnd() < 0.25 ? ent('IP', ipv4()) : null,
-      filedDaysAgo: int(1, 120),
+      filedDaysAgo: int(0, 120),
       clusterTag: null,
     });
     if (rnd() < 0.6) {
@@ -648,7 +804,20 @@ async function persist(client) {
     );
   }
 
-  // --- transactions ---
+  /**
+   * --- transactions ---
+   *
+   * `occurred_at` is written explicitly. It used to be left out of the column
+   * list, so every hop in the corpus defaulted to `now()` — which quietly broke
+   * two things at once. The Money Flow trace showed six hops that all happened
+   * at the same instant, and the VELOCITY rule, whose entire premise is "five
+   * or more inbound transfers inside 24 hours", was measuring a window that
+   * contained the whole dataset by construction. Both looked like they worked.
+   *
+   * Each hop is offset from its complaint's filing time by its position in the
+   * ladder, so the trace reads as a sequence and the velocity window measures
+   * something real.
+   */
   for (let i = 0; i < txns.length; i += 500) {
     const chunk = txns.slice(i, i + 500);
     const vals = [];
@@ -657,14 +826,27 @@ async function persist(client) {
     chunk.forEach((t) => {
       const a = entityIds.get(t.from); const b2 = entityIds.get(t.to);
       if (!a || !b2) return;
-      const b = n * 7;
-      vals.push(`($${b + 1},$${b + 2},$${b + 3},$${b + 4},$${b + 5},$${b + 6},$${b + 7})`);
-      params.push(complaintIds[t.ci], a, b2, t.amount, t.rail, t.hop, t.ref);
+
+      // A hop lands hours after the one before it — fast enough to be inside a
+      // freeze window, spread enough to be a sequence rather than an instant.
+      // `t.at` is an ISO string throughout the builders (see daysAgo).
+      const base = Date.parse(t.at);
+      const occurredAt = new Date(
+        (Number.isFinite(base) ? base : Date.now()) + (t.hop ?? 0) * 3.5 * 36e5
+      ).toISOString();
+
+      const b = n * 8;
+      vals.push(`($${b + 1},$${b + 2},$${b + 3},$${b + 4},$${b + 5},$${b + 6},$${b + 7},$${b + 8})`);
+      params.push(
+        t.ci == null ? null : complaintIds[t.ci],
+        a, b2, t.amount, t.rail, t.hop, t.ref, occurredAt
+      );
       n++;
     });
     if (!n) continue;
     await client.query(
-      `INSERT INTO transactions (complaint_id, from_entity_id, to_entity_id, amount_inr, rail, hop_index, reference)
+      `INSERT INTO transactions (complaint_id, from_entity_id, to_entity_id, amount_inr,
+                                 rail, hop_index, reference, occurred_at)
        VALUES ${vals.join(',')}`,
       params
     );

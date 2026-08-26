@@ -397,7 +397,24 @@ export default function EvidenceLocker() {
   const [selectedId, setSelectedId] = useState(null);
 
   const exhibits = data?.evidence ?? [];
-  const selected = exhibits.find((e) => e.id === selectedId) ?? exhibits[0] ?? null;
+
+  /**
+   * Open on an exhibit that has something to show.
+   *
+   * The list is newest-first, and the newest exhibit is usually the one still
+   * waiting to be anchored — so taking `exhibits[0]` opened this page on an
+   * empty custody trail reading "Not yet verified". That is a true statement
+   * about a real state, and a poor first impression of a screen whose entire
+   * subject is the custody record. Preferring a sealed exhibit means the panel
+   * opens on a digest, an anchor and a trail; the pending one is still first in
+   * the list, one click away, where its state reads as informative rather than
+   * as the page failing to load.
+   */
+  const selected = exhibits.find((e) => e.id === selectedId)
+    ?? exhibits.find((e) => e.anchor?.status === 'ANCHORED' && e.verification_count > 0)
+    ?? exhibits.find((e) => e.anchor?.status === 'ANCHORED')
+    ?? exhibits[0]
+    ?? null;
 
   return (
     <div className="flex h-full min-h-0 flex-col gap-3 p-3">

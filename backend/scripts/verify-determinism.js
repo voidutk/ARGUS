@@ -133,6 +133,18 @@ async function main() {
     process.exit(1);
   }
   console.log('  Two independent seed runs produced byte-identical content.\n');
+
+  /**
+   * This check re-seeds twice, and a seed TRUNCATEs. Everything computed or
+   * sealed after the last seed is therefore gone: entity influence and risk are
+   * back to zero, and the evidence locker is empty. Both look like ordinary
+   * page bugs if you open the UI next without knowing why — "influence 0" and
+   * "Nothing sealed yet" — so say it plainly rather than leaving it to be
+   * rediscovered an hour before a demo.
+   */
+  console.log('  NOTE — this check re-seeded the database. Scores and evidence were');
+  console.log('         truncated with it. Restore them before demoing:\n');
+  console.log('           npm run compute-scores && npm run seed:evidence\n');
 }
 
 main().catch(async (err) => {

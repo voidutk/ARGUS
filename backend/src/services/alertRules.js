@@ -170,23 +170,64 @@ const velocity = {
   title: 'High-velocity inbound transfers',
   minTransfers: 5,
   windowHours: 24,
+  /**
+   * A SLIDING 24-hour window, not the account's whole lifetime.
+   *
+   * This rule used to GROUP BY the recipient and test
+   * `MAX(occurred_at) - MIN(occurred_at) <= 24h`, which asks a different and
+   * much stronger question: did EVERY transfer this account ever received
+   * arrive inside one day? A cell wallet that took six transfers in four hours
+   * on one night, and eight more over the following three months, failed that
+   * test — max minus min spanned ninety days — so the rule stayed silent on
+   * precisely the burst it was written to catch.
+   *
+   * It went unnoticed because the seed was writing `now()` into every
+   * `occurred_at`, which made max minus min ≈ 0 and the rule match everything.
+   * A test that passes for the wrong reason and a rule that cannot fire look
+   * identical from the outside; only fixing the timestamps separated them.
+   *
+   * The window function asks the right question: for each transfer, how many
+   * arrived at this account in the preceding 24 hours? If any row reaches the
+   * threshold, the account matches, and that row's window is the one reported.
+   */
   sql: `
-    SELECT t.to_entity_id            AS entity_id,
-           COALESCE(e.label, e.value) AS label,
+    WITH windowed AS (
+      SELECT t.to_entity_id             AS eid,
+             t.occurred_at              AS ts,
+             count(*) OVER w            AS in_window,
+             sum(t.amount_inr) OVER w   AS win_amount,
+             min(t.occurred_at) OVER w  AS win_start
+        FROM transactions t
+      WINDOW w AS (
+        PARTITION BY t.to_entity_id ORDER BY t.occurred_at
+        RANGE BETWEEN make_interval(hours => $2) PRECEDING AND CURRENT ROW
+      )
+    ),
+    peak AS (
+      -- The busiest qualifying window per account; ties break to the earliest,
+      -- so the alert points at when the burst started rather than at a later
+      -- window that happens to hold the same count.
+      SELECT DISTINCT ON (eid) eid, win_start, ts AS win_end, in_window, win_amount
+        FROM windowed
+       WHERE in_window >= $1
+       ORDER BY eid, in_window DESC, ts ASC
+    )
+    SELECT p.eid                       AS entity_id,
+           COALESCE(e.label, e.value)  AS label,
            e.entity_type,
-           count(*)::int             AS transfer_count,
-           SUM(t.amount_inr)::float  AS total_inr,
-           MIN(t.occurred_at)        AS window_start,
-           MAX(t.occurred_at)        AS window_end,
-           count(DISTINCT t.from_entity_id)::int AS distinct_senders,
+           p.in_window::int            AS transfer_count,
+           p.win_amount::float         AS total_inr,
+           p.win_start                 AS window_start,
+           p.win_end                   AS window_end,
+           (SELECT count(DISTINCT t2.from_entity_id)::int
+              FROM transactions t2
+             WHERE t2.to_entity_id = p.eid
+               AND t2.occurred_at BETWEEN p.win_start AND p.win_end) AS distinct_senders,
            cl.cluster_key
-      FROM transactions t
-      JOIN entities e ON e.id = t.to_entity_id
+      FROM peak p
+      JOIN entities e ON e.id = p.eid
       LEFT JOIN clusters cl ON cl.id = e.cluster_id
-     GROUP BY t.to_entity_id, e.label, e.value, e.entity_type, cl.cluster_key
-    HAVING count(*) >= $1
-       AND MAX(t.occurred_at) - MIN(t.occurred_at) <= make_interval(hours => $2)
-     ORDER BY count(*) DESC
+     ORDER BY p.in_window DESC
      LIMIT 25`,
   params() { return [this.minTransfers, this.windowHours]; },
   fingerprint: (r) => `VELOCITY:${r.entity_id}`,

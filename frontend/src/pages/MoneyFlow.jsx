@@ -15,7 +15,7 @@
  * we were handed.
  */
 
-import { useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import { Link } from 'react-router-dom';
 import { Coins, Search } from 'lucide-react';
@@ -197,24 +197,59 @@ function Sankey({ nodes, links, height = 380 }) {
   );
 }
 
-/** The complaint picker — only complaints that actually have a trail. */
-function TrailPicker({ selectedId, onSelect }) {
+/**
+ * The complaint picker — only complaints that actually have a trail.
+ *
+ * That sentence used to be a comment above a list of every complaint in the
+ * database. Most of the corpus is unclustered noise with no transactions at
+ * all, so roughly half of what this panel offered led to an empty trace, and
+ * the only way to find that out was to click one. `transaction_count` now comes
+ * back with the list, so the filter is real: a complaint with no hops has
+ * nothing to trace and does not belong on a page about tracing.
+ *
+ * Deepest chains sort first. On a page whose subject is layering, the six-hop
+ * ladder is more informative than a single transfer, and burying it under
+ * whichever complaint happens to be newest serves nobody.
+ */
+function TrailPicker({ selectedId, onSelect, onDefault }) {
   const [query, setQuery] = useState('');
-  const { data, loading } = useApi(() => complaintsApi.list({ limit: 60 }), []);
+  const { data, loading } = useApi(() => complaintsApi.list({ limit: 200 }), []);
+
+  const traceable = useMemo(
+    () => (data?.complaints ?? [])
+      .filter((c) => (c.transaction_count ?? 0) > 0)
+      .sort((a, b) => (b.transaction_count ?? 0) - (a.transaction_count ?? 0)
+        || b.amount_inr - a.amount_inr),
+    [data]
+  );
 
   const filtered = useMemo(() => {
-    const rows = data?.complaints ?? [];
-    if (!query.trim()) return rows;
+    if (!query.trim()) return traceable;
     const q = query.trim().toLowerCase();
-    return rows.filter(
+    return traceable.filter(
       (c) => c.complaint_ref.toLowerCase().includes(q) || c.victim_name.toLowerCase().includes(q)
     );
-  }, [data, query]);
+  }, [traceable, query]);
+
+  /**
+   * Open on the deepest trail rather than on an empty panel.
+   *
+   * Arriving at a page called Money Flow and being told to go and find some
+   * money is a wasted screen — the investigator already chose this page, which
+   * is the choice that matters. The picker is the only thing that knows which
+   * complaints have a trail, so the default is raised from here once the list
+   * lands, and only when nothing is selected already (a link carrying
+   * ?complaint= must always win).
+   */
+  useEffect(() => {
+    if (selectedId || !traceable.length) return;
+    onDefault?.(traceable[0].id);
+  }, [selectedId, traceable, onDefault]);
 
   return (
     <Panel
       title="Complaints"
-      subtitle={data ? `${num(data.total)} on record` : undefined}
+      subtitle={data ? `${num(traceable.length)} with a money trail` : undefined}
       flush
       className="w-[268px] shrink-0"
     >
@@ -250,6 +285,7 @@ function TrailPicker({ selectedId, onSelect }) {
               </div>
               <span className="truncate text-[10.5px] text-faint">
                 {scamLabel(c.scam_category)} · {c.state ?? '—'}
+                {c.transaction_count > 1 && ` · ${c.transaction_count} hops`}
               </span>
             </button>
           ))
@@ -270,12 +306,22 @@ export default function MoneyFlow() {
   );
 
   const select = (id) => setParams({ complaint: String(id) });
+
+  /**
+   * `replace` so the automatic first choice does not become a history entry —
+   * otherwise Back from the first complaint you pick returns you to the same
+   * page rather than to where you came from.
+   */
+  const selectDefault = useCallback(
+    (id) => setParams({ complaint: String(id) }, { replace: true }),
+    [setParams]
+  );
   const summary = data?.summary;
   const recoverable = summary ? summary.total_inr - summary.leakage_inr : 0;
 
   return (
     <div className="flex h-full min-h-0 gap-3 p-3">
-      <TrailPicker selectedId={complaintId} onSelect={select} />
+      <TrailPicker selectedId={complaintId} onSelect={select} onDefault={selectDefault} />
 
       <div className="flex min-w-0 flex-1 flex-col gap-3">
         {!complaintId ? (

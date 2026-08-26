@@ -143,18 +143,68 @@ export default function GeoIntelligence() {
   }, [layer, synthetic.data, official.data]);
 
   /**
-   * Which symbols get a label.
+   * Label placement, with collision avoidance.
    *
-   * Sizing alone is not a good enough gate: the northern plain packs Delhi,
-   * Haryana, Punjab, Rajasthan and Uttar Pradesh into a few hundred pixels, and
-   * labelling every sizeable bubble there produced a stack of overlapping text.
-   * The top eight by volume are the ones worth naming unprompted; everything
-   * else names itself on hover.
+   * Ranking by volume and labelling the top eight was not enough, and the map
+   * proved it: the eight largest states include Delhi and Uttar Pradesh, which
+   * sit a few pixels apart on the northern plain, and Karnataka, Tamil Nadu and
+   * Kerala, which stack in the south. Fixed offsets turned all five into one
+   * illegible smear of overlapping text.
+   *
+   * So placement is resolved rather than assumed. Each candidate is tried
+   * above, below, right then left of its symbol, and taken only if that box
+   * clears every label already placed, every symbol on the map, and the panel
+   * edges. Biggest volume picks first, so when the south is too crowded for
+   * three names it is the smallest that goes unlabelled — and it still names
+   * itself on hover, which is why dropping one is acceptable.
    */
-  const labelled = useMemo(() => {
-    const top = [...points].sort((a, b) => b.value - a.value).slice(0, 8);
-    return new Set(top.map((p) => p.state));
+  const placedLabels = useMemo(() => {
+    const CHAR_W = 6.15;   // measured against Inter 12px/600
+    const LINE_H = 13;
+    const PAD = 5;
+
+    const sized = points
+      .map((p) => {
+        const xy = projection(p.coord);
+        return xy ? { ...p, x: xy[0], y: xy[1], r: radiusFor(p.value, p.max) } : null;
+      })
+      .filter(Boolean)
+      .sort((a, b) => b.value - a.value);
+
+    const hit = (a, b) =>
+      !(a.x + a.w < b.x || b.x + b.w < a.x || a.y + a.h < b.y || b.y + b.h < a.y);
+
+    // Every symbol is an obstacle, not just the labelled ones — a name resting
+    // on an unlabelled bubble is just as unreadable.
+    const symbols = sized.map((s) => ({ x: s.x - s.r, y: s.y - s.r, w: s.r * 2, h: s.r * 2 }));
+    const taken = [];
+    const out = [];
+
+    for (const s of sized) {
+      const w = s.state.length * CHAR_W + PAD * 2;
+      const candidates = [
+        { x: s.x - w / 2, y: s.y - s.r - 4 - LINE_H, tx: s.x, ty: s.y - s.r - 7, anchor: 'middle' },
+        { x: s.x - w / 2, y: s.y + s.r + 4, tx: s.x, ty: s.y + s.r + 15, anchor: 'middle' },
+        { x: s.x + s.r + 5, y: s.y - LINE_H / 2, tx: s.x + s.r + 5, ty: s.y + 4, anchor: 'start' },
+        { x: s.x - s.r - 5 - w, y: s.y - LINE_H / 2, tx: s.x - s.r - 5, ty: s.y + 4, anchor: 'end' },
+      ];
+
+      const fit = candidates.find((c) => {
+        const box = { x: c.x, y: c.y, w, h: LINE_H };
+        if (box.x < 4 || box.y < 4 || box.x + box.w > WIDTH - 4 || box.y + box.h > HEIGHT - 4) {
+          return false;
+        }
+        return !taken.some((t) => hit(box, t)) && !symbols.some((o) => hit(box, o));
+      });
+
+      if (!fit) continue;
+      taken.push({ x: fit.x, y: fit.y, w, h: LINE_H });
+      out.push({ state: s.state, x: fit.tx, y: fit.ty, anchor: fit.anchor });
+    }
+    return out;
   }, [points]);
+
+  const labelled = useMemo(() => new Set(placedLabels.map((l) => l.state)), [placedLabels]);
 
   const plottedCount = points.length;
   const totalRows = (layer === 'NCRB' ? official.data?.states : synthetic.data?.states)?.length ?? 0;
@@ -172,11 +222,28 @@ export default function GeoIntelligence() {
         right={
           <div className="flex items-center gap-1.5">
             <Provenance of={provenanceOf(active.data)} />
+            {/*
+              Routes are derived from OUR cluster membership, so they have no
+              meaning over the NCRB layer — that is an aggregate case count with
+              no network behind it. The control is disabled rather than hidden:
+              hiding it would leave the reader wondering where it went, while a
+              disabled control with a reason explains the data model.
+            */}
             <button
               type="button"
+              disabled={layer !== 'SYNTHETIC'}
               onClick={() => setShowRoutes((v) => !v)}
-              className={cn('chip cursor-pointer', showRoutes && 'border-blue text-txt')}
-              title="Interstate routes, inferred from cluster activity"
+              className={cn(
+                'chip',
+                layer === 'SYNTHETIC'
+                  ? cn('cursor-pointer', showRoutes && 'border-blue text-txt')
+                  : 'cursor-not-allowed opacity-40'
+              )}
+              title={
+                layer === 'SYNTHETIC'
+                  ? 'Interstate routes, inferred from cluster activity'
+                  : 'Routes come from cluster membership in our own corpus — NCRB is an aggregate table with no network behind it'
+              }
             >
               <Route className="size-2.5" strokeWidth={2} /> Routes
             </button>
@@ -259,30 +326,73 @@ export default function GeoIntelligence() {
                         stroke={colour}
                         strokeWidth={isHovered ? 2 : 1.2}
                       />
-                      {(isHovered || labelled.has(p.state)) && (
-                        <>
-                          <text
-                            x={x}
-                            y={y - r - 6}
-                            textAnchor="middle"
-                            className="fill-txt"
-                            style={{ fontSize: 12, fontFamily: 'Inter, sans-serif', fontWeight: 600, paintOrder: 'stroke', stroke: '#080b12', strokeWidth: 3 }}
-                          >
-                            {p.state}
-                          </text>
-                          <text
-                            x={x}
-                            y={y + 4}
-                            textAnchor="middle"
-                            style={{ fontSize: 11, fontFamily: 'JetBrains Mono, monospace', fontWeight: 600, fill: '#e6edf7', paintOrder: 'stroke', stroke: '#080b12', strokeWidth: 3 }}
-                          >
-                            {num(p.value)}
-                          </text>
-                        </>
+                      {/*
+                        The count sits inside every symbol large enough to hold
+                        it, whether or not the state won a name. A ring with no
+                        number is a shape the reader cannot interrogate; a ring
+                        with a number is already answering "how many", and the
+                        name is then the only thing hover has to supply.
+                      */}
+                      {r >= 9 && (
+                        <text
+                          x={x}
+                          y={y + 4}
+                          textAnchor="middle"
+                          style={{ fontSize: 11, fontFamily: 'JetBrains Mono, monospace', fontWeight: 600, fill: '#e6edf7', paintOrder: 'stroke', stroke: '#080b12', strokeWidth: 3 }}
+                        >
+                          {num(p.value)}
+                        </text>
                       )}
                     </g>
                   );
                 })}
+
+                {/*
+                  Names are drawn last, in one pass, so a label always sits over
+                  the symbols rather than under whichever bubble happened to be
+                  rendered after it.
+                */}
+                <g style={{ pointerEvents: 'none' }}>
+                  {placedLabels.map((l) => (
+                    <text
+                      key={l.state}
+                      x={l.x}
+                      y={l.y}
+                      textAnchor={l.anchor}
+                      className="fill-txt"
+                      style={{
+                        fontSize: 12,
+                        fontFamily: 'Inter, sans-serif',
+                        fontWeight: 600,
+                        paintOrder: 'stroke',
+                        stroke: '#080b12',
+                        strokeWidth: 3,
+                        opacity: hovered && hovered !== l.state ? 0.45 : 1,
+                      }}
+                    >
+                      {l.state}
+                    </text>
+                  ))}
+
+                  {/* A hovered state that lost the placement contest still gets named. */}
+                  {hovered && !labelled.has(hovered) && (() => {
+                    const p = points.find((q) => q.state === hovered);
+                    const xy = p && projection(p.coord);
+                    if (!xy) return null;
+                    const r = radiusFor(p.value, p.max);
+                    return (
+                      <text
+                        x={xy[0]}
+                        y={xy[1] - r - 7}
+                        textAnchor="middle"
+                        className="fill-txt"
+                        style={{ fontSize: 12, fontFamily: 'Inter, sans-serif', fontWeight: 600, paintOrder: 'stroke', stroke: '#080b12', strokeWidth: 3.5 }}
+                      >
+                        {p.state}
+                      </text>
+                    );
+                  })()}
+                </g>
               </svg>
             </div>
 

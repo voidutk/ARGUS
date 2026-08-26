@@ -47,6 +47,11 @@ const list = asyncHandler(async (req, res) => {
      SELECT f.id, f.complaint_ref, f.victim_name, f.scam_category, f.amount_inr::float AS amount_inr,
             f.state, f.district, f.status, f.filed_at,
             (SELECT count(*)::int FROM complaint_entities ce WHERE ce.complaint_id = f.id) AS entity_count,
+            -- How many hops the money trace has. Additive to the contract, and
+            -- it is what lets the Money Flow picker show which complaints
+            -- actually have a trail to follow instead of listing all 220 and
+            -- letting the investigator find the empty ones by clicking them.
+            (SELECT count(*)::int FROM transactions tx WHERE tx.complaint_id = f.id) AS transaction_count,
             count(*) OVER ()::int AS total_count
        FROM filtered f
       ORDER BY f.filed_at DESC, f.id DESC

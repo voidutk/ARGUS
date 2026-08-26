@@ -24,6 +24,80 @@ cytoscape.use(fcose);
 /** Edge thickness from link strength, compressed so a weight of 6 is not a slab. */
 const edgeWidth = (weight) => 0.6 + Math.min(6, Math.max(1, Number(weight) || 1)) * 0.42;
 
+/**
+ * Decide where each neighbour's label sits, and drop the ones that will not fit.
+ *
+ * Capping the label count was necessary and not sufficient. Ten names still
+ * collided, because every one of them was drawn at the same fixed offset below
+ * its node — and a coordinator's neighbours sit in a ring, so the ones at the
+ * same height overlapped every time ("ICICI Bank mule B" landing on top of
+ * "Punjab National Bank mule A"). Cytoscape ships no label-collision solver, so
+ * this is it.
+ *
+ * Two ideas do the work. Labels are pushed RADIALLY OUTWARD from the selected
+ * node — a neighbour to the left gets a left-aligned label, one above gets its
+ * label above — which turns a star topology's own geometry into the thing that
+ * separates the text. Then each placement is checked against the ones already
+ * taken, most-influential first, and a label with nowhere to go is not drawn at
+ * all. A missing name costs one hover; an unreadable pile costs the whole view.
+ *
+ * Boxes are computed in model coordinates. Cytoscape scales label glyphs with
+ * zoom exactly as it scales positions, so the two stay in the same units and
+ * the result holds at any zoom level.
+ */
+function placeLabels(centre, neighbours) {
+  const FONT = 11;
+  const CHAR_W = FONT * 0.55;   // Inter 500, averaged over mixed-case text
+  const LINE_H = FONT * 1.25;
+  const GAP = 4;
+  const MAX_W = 120;            // matches 'text-max-width' in graphStyle
+
+  const cx = centre.position('x');
+  const cy = centre.position('y');
+
+  const boxFor = (n, place) => {
+    const w = Math.min(MAX_W, String(n.data('label') ?? '').length * CHAR_W) + 6;
+    const r = nodeSize(n.data('influence')) / 2;
+    const x = n.position('x');
+    const y = n.position('y');
+    if (place === 'top') return { x: x - w / 2, y: y - r - GAP - LINE_H, w, h: LINE_H };
+    if (place === 'bottom') return { x: x - w / 2, y: y + r + GAP, w, h: LINE_H };
+    if (place === 'left') return { x: x - r - GAP - w, y: y - LINE_H / 2, w, h: LINE_H };
+    return { x: x + r + GAP, y: y - LINE_H / 2, w, h: LINE_H };
+  };
+
+  const overlaps = (a, b) =>
+    !(a.x + a.w < b.x || b.x + b.w < a.x || a.y + a.h < b.y || b.y + b.h < a.y);
+
+  // The selected node keeps its own label below itself, and claims that space
+  // first — it is the one name that must never be dropped.
+  centre.style({ 'text-valign': 'bottom', 'text-halign': 'center', 'text-margin-x': 0, 'text-margin-y': 5 });
+  const taken = [boxFor(centre, 'bottom')];
+
+  for (const n of neighbours) {
+    const dx = n.position('x') - cx;
+    const dy = n.position('y') - cy;
+
+    // Try outward first, then the perpendicular directions, then back inward.
+    const outward = Math.abs(dx) > Math.abs(dy)
+      ? (dx >= 0 ? ['right', 'top', 'bottom', 'left'] : ['left', 'top', 'bottom', 'right'])
+      : (dy >= 0 ? ['bottom', 'right', 'left', 'top'] : ['top', 'right', 'left', 'bottom']);
+
+    const choice = outward.find((place) => !taken.some((t) => overlaps(boxFor(n, place), t)));
+    if (!choice) continue;   // no room — hover still names it
+
+    taken.push(boxFor(n, choice));
+    n.style({
+      'text-valign': choice === 'top' ? 'top' : choice === 'bottom' ? 'bottom' : 'center',
+      'text-halign': choice === 'left' ? 'left' : choice === 'right' ? 'right' : 'center',
+      'text-margin-x': choice === 'left' ? -GAP : choice === 'right' ? GAP : 0,
+      'text-margin-y': choice === 'top' ? -GAP : choice === 'bottom' ? GAP : 0,
+      'text-max-width': MAX_W,
+    });
+    n.addClass('labelled');
+  }
+}
+
 /** API payload → Cytoscape elements, with the visual encoding attached. */
 function toElements(nodes = [], edges = []) {
   const present = new Set(nodes.map((n) => n.id));
@@ -155,6 +229,12 @@ export default function GraphCanvas({
     cy.batch(() => {
       cy.elements().removeClass('faded highlighted labelled');
 
+      // Label placement writes inline styles per node. Those override the
+      // stylesheet and survive a class change, so a node labelled to the LEFT
+      // for one selection would keep pointing left under the next one. Clearing
+      // them here means each selection starts from the stylesheet defaults.
+      cy.nodes().removeStyle('text-valign text-halign text-margin-x text-margin-y text-max-width');
+
       if (!selectedId) {
         // Nothing selected: label only the coordinators, so the page always
         // answers "who runs this" without the investigator clicking anything.
@@ -190,13 +270,14 @@ export default function GraphCanvas({
       // silently left every neighbour labelled — the overlap this cap exists to
       // prevent. An array does exactly what it says.
       node.addClass('labelled');
-      neighbourhood
+      const candidates = neighbourhood
         .nodes()
         .toArray()
         .filter((n) => n.id() !== selectedId)
         .sort((a, b) => (b.data('influence') ?? 0) - (a.data('influence') ?? 0))
-        .slice(0, LABEL_CAP)
-        .forEach((n) => n.addClass('labelled'));
+        .slice(0, LABEL_CAP);
+
+      placeLabels(node, candidates);
 
       cy.$(':selected').unselect();
       node.select();

@@ -70,12 +70,27 @@ function Meta({ metadata }) {
       .slice(0, 5);
   }, [metadata]);
 
+  /** Trim to the last whole word inside `max`, and say that it was trimmed. */
+  function clip(value, max) {
+    const s = String(value);
+    if (s.length <= max) return s;
+    const cut = s.slice(0, max);
+    const lastSpace = cut.lastIndexOf(' ');
+    return `${(lastSpace > max * 0.6 ? cut.slice(0, lastSpace) : cut).trimEnd()}…`;
+  }
+
   if (!pairs.length) return null;
   return (
     <div className="mt-1 flex flex-wrap items-center gap-1">
       {pairs.map(([k, v]) => (
         <span key={k} className="mn rounded-[2px] border border-hair bg-raise/50 px-1.5 py-[1px] text-[9.5px] text-faint">
-          {k.replace(/_/g, ' ')} <span className="text-dim">{String(v).slice(0, 30)}</span>
+          {/*
+            Cut on a word boundary and mark the cut. A hard slice rendered
+            "Coordinator identified in Digi", which reads as a corrupted value
+            rather than a shortened one — the reader cannot tell whether the
+            record itself is damaged. An ellipsis says "there is more".
+          */}
+          {k.replace(/_/g, ' ')} <span className="text-dim" title={String(v)}>{clip(v, 34)}</span>
         </span>
       ))}
     </div>

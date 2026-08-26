@@ -105,18 +105,42 @@ const runAnalytics = asyncHandler(async (req, res) => {
     ipAddress: audit.clientIp(req),
   });
 
+  /**
+   * Write the scores back, on BOTH paths.
+   *
+   * This used to call `graph.load({ force: true })` and report `nodes_scored`,
+   * which read as success and persisted nothing — the scores lived in the
+   * in-memory graph and the `entities.influence_score` / `risk_score` columns
+   * stayed at their default of zero. Anything reading the graph (the Explorer)
+   * looked right; anything reading the table (Networks, the entity list, entity
+   * detail) showed "influence 0" next to the coordinator, which is precisely
+   * the number the whole demo turns on.
+   *
+   * The intel-service path needs it too: intel-service computes over Neo4j and
+   * does not write to Postgres either, so without this the same columns stay
+   * empty on the healthy path as well.
+   */
+  const persisted = await graph.persistScores();
+
   if (!live.ok) {
-    // Express recomputes influence itself on the fallback path, so the Explorer
-    // still shows fresh scores — just not Neo4j-backed Louvain.
-    const g = await graph.load({ force: true });
     return res.status(202).json({
       source: 'postgres-fallback',
       reason: live.reason,
-      nodes_scored: g.nodes.size,
+      nodes_scored: persisted.entities,
+      entities_scored: persisted.scored,
+      top_influence: persisted.top_influence,
+      top_risk: persisted.top_risk,
       duration_ms: Date.now() - started,
     });
   }
-  res.json({ ...live.data, source: 'intel-service', duration_ms: Date.now() - started });
+  res.json({
+    ...live.data,
+    source: 'intel-service',
+    entities_scored: persisted.scored,
+    top_influence: persisted.top_influence,
+    top_risk: persisted.top_risk,
+    duration_ms: Date.now() - started,
+  });
 });
 
 // ---------------------------------------------------------------------------

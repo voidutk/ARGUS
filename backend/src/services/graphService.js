@@ -531,8 +531,138 @@ async function common(aId, bId) {
   };
 }
 
+/**
+ * Risk-scoring weights — PLAN §I.5.
+ *
+ * Declared here, in the open, rather than buried in the SQL that gathers the
+ * inputs. Anyone asking "why is this wallet an 80?" gets an answer in four
+ * numbers that sum to one, and `GET /entities/:id/why` reads them straight off
+ * this object rather than restating them.
+ *
+ * They are round numbers on purpose. There is no labelled corpus of "true"
+ * entity risk to fit against, so any more precise-looking weight (0.27, 0.31)
+ * would be fabricated precision — it would imply a training run that never
+ * happened. Round weights say what this is: a declared policy, not a model.
+ */
+const RISK_WEIGHTS = {
+  complaints: 0.30,  // how many separate victims name it
+  amount: 0.25,      // total rupee exposure across those complaints
+  spread: 0.20,      // how many states it reaches — organised, not local
+  reuse: 0.25,       // shared-infrastructure links to other entities
+};
+
+/**
+ * Writes the derived scores back onto `entities`.
+ *
+ * PLAN §288 says the analytics job writes `cluster_id`, `influence` and `risk`
+ * back onto each node, and until now nothing did. The columns existed, the UI
+ * read them, and every entity in the database sat at zero — so the Networks
+ * page displayed "influence 0" beside the coordinator whose whole significance
+ * is that centrality ranks him first. The Explorer looked correct only because
+ * it reads the in-memory graph and never touches these columns.
+ *
+ * `is_flagged` is deliberately NOT an input to risk. It is the label a human
+ * already attached to an entity, and feeding it into the score would make the
+ * score partly a restatement of that judgement — the model would "discover"
+ * exactly what someone typed in. Risk here is computed from behaviour alone,
+ * which is what makes it capable of disagreeing with the flag.
+ */
+async function persistScores() {
+  // `byEntityId` is the entities.id -> nodeId map the build already keeps.
+  // Node ids are `<type>:<normalized_value>`, so they cannot be derived from a
+  // numeric id alone — this map is the only correct way across.
+  const { nodes, byEntityId } = await load({ force: true });
+
+  // Inputs for risk, gathered per entity. Complaints are de-duplicated first:
+  // an entity linked to the same complaint under two roles must not count twice.
+  const { rows } = await pool.query(`
+    WITH ec AS (
+      SELECT DISTINCT entity_id, complaint_id FROM complaint_entities
+    ),
+    agg AS (
+      SELECT ec.entity_id AS id,
+             count(*)                                                    AS complaints,
+             count(DISTINCT c.state) FILTER (WHERE c.state IS NOT NULL)  AS states,
+             COALESCE(sum(c.amount_inr), 0)                              AS amount
+        FROM ec JOIN complaints c ON c.id = ec.complaint_id
+       GROUP BY ec.entity_id
+    ),
+    lnk AS (
+      SELECT id, sum(n) AS links FROM (
+        SELECT from_entity_id AS id, count(*) AS n FROM entity_links GROUP BY 1
+        UNION ALL
+        SELECT to_entity_id   AS id, count(*) AS n FROM entity_links GROUP BY 1
+      ) t GROUP BY id
+    )
+    SELECT e.id,
+           COALESCE(agg.complaints, 0)::int   AS complaints,
+           COALESCE(agg.states, 0)::int       AS states,
+           COALESCE(agg.amount, 0)::float8    AS amount,
+           COALESCE(lnk.links, 0)::int        AS links
+      FROM entities e
+      LEFT JOIN agg ON agg.id = e.id
+      LEFT JOIN lnk ON lnk.id = e.id`);
+
+  if (!rows.length) return { entities: 0, scored: 0 };
+
+  /**
+   * Normalise against the corpus, not against a constant.
+   *
+   * Complaint counts and rupee amounts are heavy-tailed — one entity touching
+   * forty complaints would flatten everything else to nearly zero under linear
+   * scaling, and the ranking below it would carry no information. A square root
+   * compresses that tail while preserving order, so the middle of the
+   * distribution stays legible. States and links are small integers already and
+   * are scaled linearly.
+   */
+  const max = {
+    complaints: Math.max(1, ...rows.map((r) => r.complaints)),
+    amount: Math.max(1, ...rows.map((r) => r.amount)),
+    states: Math.max(1, ...rows.map((r) => r.states)),
+    links: Math.max(1, ...rows.map((r) => r.links)),
+  };
+  const sqrtNorm = (v, m) => (m <= 0 ? 0 : Math.sqrt(Math.max(0, v) / m));
+  const linNorm = (v, m) => (m <= 0 ? 0 : Math.min(1, Math.max(0, v) / m));
+
+  const updates = rows.map((r) => {
+    const risk = Math.round(100 * (
+      RISK_WEIGHTS.complaints * sqrtNorm(r.complaints, max.complaints)
+      + RISK_WEIGHTS.amount * sqrtNorm(r.amount, max.amount)
+      + RISK_WEIGHTS.spread * linNorm(r.states, max.states)
+      + RISK_WEIGHTS.reuse * linNorm(r.links, max.links)
+    ));
+    const node = nodes.get(byEntityId.get(r.id));
+    return {
+      id: r.id,
+      influence: Math.max(0, Math.min(100, Math.round(node?.influence ?? 0))),
+      risk: Math.max(0, Math.min(100, risk)),
+    };
+  });
+
+  // One statement rather than 962. UNNEST keeps it a single round trip and a
+  // single plan, which matters because this runs inside a request.
+  await pool.query(
+    `UPDATE entities e
+        SET influence_score = v.influence,
+            risk_score      = v.risk
+       FROM (SELECT * FROM unnest($1::int[], $2::int[], $3::int[])
+                       AS t(id, influence, risk)) v
+      WHERE e.id = v.id
+        AND (e.influence_score IS DISTINCT FROM v.influence
+             OR e.risk_score   IS DISTINCT FROM v.risk)`,
+    [updates.map((u) => u.id), updates.map((u) => u.influence), updates.map((u) => u.risk)]
+  );
+
+  return {
+    entities: updates.length,
+    scored: updates.filter((u) => u.influence > 0 || u.risk > 0).length,
+    top_influence: Math.max(0, ...updates.map((u) => u.influence)),
+    top_risk: Math.max(0, ...updates.map((u) => u.risk)),
+  };
+}
+
 module.exports = {
   load, invalidate, overview, neighbors, cluster, nodeIdForEntity,
-  why, path, common,
+  why, path, common, persistScores, RISK_WEIGHTS,
   entNodeId, complaintNodeId,
 };

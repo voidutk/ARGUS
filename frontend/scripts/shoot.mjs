@@ -19,7 +19,10 @@ import path from 'node:path';
 
 const OUT = process.argv[2] || 'shots';
 const BASE = process.env.ARGUS_UI ?? 'http://localhost:5173';
-const CRED = { email: 'investigator@argus.gov.in', password: 'argus2026' };
+const CRED = {
+  email: process.env.ARGUS_EMAIL ?? 'investigator@argus.gov.in',
+  password: process.env.ARGUS_PASSWORD ?? 'argus2026',
+};
 
 /** Graph layouts animate; a fixed wait is the difference between a picture of
  *  the network and a picture of it mid-flight. */
