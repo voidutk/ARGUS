@@ -1,5 +1,6 @@
 const express = require('express');
 const cors = require('cors');
+const helmet = require('helmet');
 const env = require('./config/env');
 const routes = require('./routes');
 const { apiLimiter } = require('./middleware/rateLimit');
@@ -7,6 +8,9 @@ const errorHandler = require('./middleware/errorHandler');
 
 const app = express();
 
+// A pure JSON API never serves HTML, so helmet's defaults (HSTS, no-sniff,
+// frame-deny, etc.) apply cleanly with no CSP tuning needed for this app.
+app.use(helmet());
 app.use(cors({ origin: env.corsOrigin, credentials: true }));
 app.use(express.json({ limit: '2mb' }));
 

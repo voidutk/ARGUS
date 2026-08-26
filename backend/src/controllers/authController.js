@@ -32,12 +32,33 @@ async function login(req, res, next) {
     if (!email || !password) {
       return res.status(400).json({ error: 'Email and password are required' });
     }
+    const normalizedEmail = String(email).toLowerCase().trim();
+
+    // Per-ACCOUNT lockout, independent of rateLimit.loginLimiter's per-IP
+    // window. An attacker spreading guesses across many IPs (or behind a
+    // rotating proxy) never trips the IP limiter but still hits this one,
+    // because it counts failures against the target account regardless of
+    // where they came from. Checked before bcrypt.compare so a locked-out
+    // account also stops burning CPU on hash comparisons.
+    const { rows: recentFailures } = await pool.query(
+      `SELECT count(*)::int AS n FROM audit_logs
+        WHERE action = 'LOGIN_FAILED' AND metadata->>'email' = $1
+          AND created_at > now() - ($2 || ' minutes')::interval`,
+      [normalizedEmail, String(env.loginLockoutWindowMin)]
+    );
+    if (recentFailures[0].n >= env.loginLockoutThreshold) {
+      await audit.log({
+        action: 'LOGIN_LOCKED', entityType: 'user',
+        metadata: { email: normalizedEmail }, ipAddress: audit.clientIp(req),
+      });
+      return res.status(429).json({ error: 'Too many failed sign-in attempts for this account. Try again later.' });
+    }
 
     const { rows } = await pool.query(
       `SELECT u.*, un.code AS unit_code, un.name AS unit_name
          FROM users u LEFT JOIN units un ON un.id = u.unit_id
         WHERE u.email = $1`,
-      [String(email).toLowerCase().trim()]
+      [normalizedEmail]
     );
     const user = rows[0];
 
@@ -47,7 +68,7 @@ async function login(req, res, next) {
     if (!ok) {
       await audit.log({
         actorId: user?.id, action: 'LOGIN_FAILED', entityType: 'user',
-        metadata: { email }, ipAddress: audit.clientIp(req),
+        metadata: { email: normalizedEmail }, ipAddress: audit.clientIp(req),
       });
       return res.status(401).json({ error: 'Invalid email or password' });
     }

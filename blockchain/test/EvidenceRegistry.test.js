@@ -33,6 +33,10 @@ describe('EvidenceRegistry', function () {
       expect(exists).to.equal(false);
     });
 
+    it('isValid is false for a digest that was never registered', async function () {
+      expect(await registry.isValid(digestOf('never-uploaded.pdf'))).to.equal(false);
+    });
+
     it('rejects a zero digest', async function () {
       await expect(
         registry.registerEvidence(ethers.ZeroHash, 1, 'DOCUMENT', 'CCPS-BLR')
@@ -129,6 +133,18 @@ describe('EvidenceRegistry', function () {
       ).to.not.be.reverted;
     });
 
+    it('revoking REGISTRAR_ROLE takes effect immediately', async function () {
+      const role = await registry.REGISTRAR_ROLE();
+      await registry.grantRole(role, registrar.address);
+      await registry.connect(registrar).registerEvidence(digestOf('revoke-1'), 1, 'DOCUMENT', 'CCPS-BLR');
+
+      await registry.revokeRole(role, registrar.address);
+
+      await expect(
+        registry.connect(registrar).registerEvidence(digestOf('revoke-2'), 2, 'DOCUMENT', 'CCPS-BLR')
+      ).to.be.revertedWithCustomError(registry, 'AccessControlUnauthorizedAccount');
+    });
+
     it('blocks a non-admin from sealing', async function () {
       const digest = digestOf('w');
       await registry.registerEvidence(digest, 1, 'DOCUMENT', 'CCPS-BLR');
@@ -182,6 +198,15 @@ describe('EvidenceRegistry', function () {
         registry.registerEvidence(digestOf('after-pause.png'), 3, 'SCREENSHOT', 'CCPS-BLR')
       ).to.not.be.reverted;
     });
+
+    it('sealing has no whenNotPaused guard — an admin can still withdraw an exhibit mid-incident', async function () {
+      const digest = digestOf('seal-during-pause.png');
+      await registry.registerEvidence(digest, 1, 'SCREENSHOT', 'CCPS-BLR');
+      await registry.pause();
+
+      await expect(registry.sealEvidence(digest, 'withdrawn while paused')).to.not.be.reverted;
+      expect((await registry.verifyEvidence(digest)).record.sealed_).to.equal(true);
+    });
   });
 
   describe('enumeration', function () {
@@ -193,6 +218,11 @@ describe('EvidenceRegistry', function () {
       expect(await registry.totalRegistered()).to.equal(2n);
       expect(await registry.digestAt(0)).to.equal(a);
       expect(await registry.digestAt(1)).to.equal(b);
+    });
+
+    it('reverts reading past the end of the digest list', async function () {
+      await registry.registerEvidence(digestOf('only-one'), 1, 'DOCUMENT', 'CCPS-BLR');
+      await expect(registry.digestAt(1)).to.be.reverted; // Solidity array out-of-bounds panic
     });
   });
 });

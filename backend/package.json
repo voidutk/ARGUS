@@ -12,6 +12,8 @@
     "verify-plant": "node scripts/verify-plant.js",
     "smoke": "node scripts/smoke.js",
     "evidence-e2e": "node scripts/evidence-e2e.js",
+    "integrity-sweep": "node scripts/integrity-sweep.js",
+    "rotate-evidence-key": "node scripts/rotate-evidence-key.js",
     "verify-all": "npm run verify-plant && npm run smoke && npm run evidence-e2e"
   },
   "dependencies": {
@@ -22,6 +24,7 @@
     "ethers": "^6.17.0",
     "express": "^4.19.2",
     "express-rate-limit": "^7.5.1",
+    "helmet": "^8.0.0",
     "jsonwebtoken": "^9.0.2",
     "multer": "^2.2.0",
     "pg": "^8.12.0"

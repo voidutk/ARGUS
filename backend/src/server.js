@@ -36,6 +36,11 @@ async function start() {
     : `  chain            down — ${c.reason} (uploads still work, anchors stay PENDING)`);
   console.log('');
 
+  // Sweeps every 5 minutes for anchors stuck FAILED/PENDING and requeues them,
+  // so a transient RPC outage during one upload does not leave that exhibit
+  // unanchored until someone notices by hand.
+  chain.startAnchorRetrySweep();
+
   const shutdown = (sig) => {
     console.log(`\n${sig} received — closing`);
     server.close(() => pool.end().then(() => process.exit(0)));

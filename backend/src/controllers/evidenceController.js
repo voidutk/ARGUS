@@ -5,6 +5,16 @@ const hashService = require('../services/hashService');
 const chain = require('../services/chainService');
 const audit = require('../services/auditService');
 
+const EVIDENCE_TYPES = ['SCREENSHOT', 'BANK_STATEMENT', 'CHAT_LOG', 'CALL_RECORD', 'DOCUMENT', 'OTHER'];
+
+// Binds ciphertext to the specific evidence row via AES-GCM's AAD (see
+// cryptoService.encrypt). Using the row's own primary key means an attacker
+// with DB + disk write access cannot copy another exhibit's entire crypto
+// envelope (ciphertext + iv + auth_tag + sha256_hash) onto this row's identity
+// and have it decrypt and hash-match cleanly — the AAD used at encryption time
+// would not match this row's id.
+const aadFor = (evidenceId) => `evidence:${evidenceId}`;
+
 const anchorView = (r) => ({
   status: r.anchor_status || 'PENDING',
   tx_hash: r.tx_hash || null,
@@ -62,24 +72,43 @@ async function list(req, res, next) {
  * The SHA-256 is taken over the PLAINTEXT, before encryption. Ciphertext gets a
  * fresh IV every time it is written, so a ciphertext digest would never match
  * across re-encryption and would prove nothing about the exhibit.
+ *
+ * The row is inserted in two steps: reserve the id first with placeholder
+ * crypto columns, then encrypt bound to that id (aadFor) and fill them in.
+ * The alternative — encrypting before insert — would leave the AAD with
+ * nothing stable to bind to, since the id does not exist yet.
  */
 async function upload(req, res, next) {
   try {
     if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
     const { title, evidence_type = 'DOCUMENT', complaint_id } = req.body;
 
+    if (!EVIDENCE_TYPES.includes(evidence_type)) {
+      return res.status(400).json({ error: `evidence_type must be one of: ${EVIDENCE_TYPES.join(', ')}` });
+    }
+    if (complaint_id !== undefined && complaint_id !== '' && !Number.isFinite(Number(complaint_id))) {
+      return res.status(400).json({ error: 'complaint_id must be a number' });
+    }
+
     const plaintext = req.file.buffer;
     const sha256 = hashService.sha256(plaintext);
-    const { ciphertext, iv, authTag } = crypto.encrypt(plaintext);
+
+    const { rows: reserved } = await pool.query(
+      `INSERT INTO evidence (complaint_id, title, filename, mime_type, size_bytes, evidence_type,
+                             sha256_hash, encrypted_path, iv, auth_tag, uploaded_by)
+       VALUES ($1,$2,$3,$4,$5,$6,'', '', '', '', $7) RETURNING id`,
+      [complaint_id ? Number(complaint_id) : null, title || req.file.originalname,
+       req.file.originalname, req.file.mimetype, plaintext.length, evidence_type, req.user.id]
+    );
+    const id = reserved[0].id;
+
+    const { ciphertext, iv, authTag, keyVersion } = crypto.encrypt(plaintext, aadFor(id));
     const storedName = await storage.write(ciphertext);
 
     const { rows } = await pool.query(
-      `INSERT INTO evidence (complaint_id, title, filename, mime_type, size_bytes, evidence_type,
-                             sha256_hash, encrypted_path, iv, auth_tag, uploaded_by)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *`,
-      [complaint_id ? Number(complaint_id) : null, title || req.file.originalname,
-       req.file.originalname, req.file.mimetype, plaintext.length, evidence_type,
-       sha256, storedName, iv, authTag, req.user.id]
+      `UPDATE evidence SET sha256_hash=$2, encrypted_path=$3, iv=$4, auth_tag=$5, key_version=$6
+        WHERE id=$1 RETURNING *`,
+      [id, sha256, storedName, iv, authTag, keyVersion]
     );
     const ev = rows[0];
 
@@ -126,10 +155,12 @@ async function verify(req, res, next) {
     let readError = null;
     try {
       const ciphertext = await storage.read(ev.encrypted_path);
-      const plaintext = crypto.decrypt(ciphertext, ev.iv, ev.auth_tag);
+      const plaintext = crypto.decrypt(ciphertext, ev.iv, ev.auth_tag, aadFor(ev.id), ev.key_version);
       computedHash = hashService.sha256(plaintext);
     } catch (e) {
-      // AES-GCM refusing to decrypt IS a tamper signal, not an incidental error.
+      // AES-GCM refusing to decrypt IS a tamper signal, not an incidental error
+      // — including a wrong-AAD failure, which now also means "this row's
+      // crypto envelope did not originate from this row".
       readError = e.message;
     }
 
@@ -142,8 +173,14 @@ async function verify(req, res, next) {
       : !onChain.exists ? 'digest matches but is not registered on-chain'
       : 'integrity confirmed';
 
+    // The relayer wallet submits every anchoring/logging transaction, so
+    // on-chain msg.sender is always the same address regardless of which
+    // investigator actually ran the check — the chain alone cannot tell them
+    // apart. Folding the investigator's identity into the note is what keeps
+    // per-officer accountability inside the immutable custody trail itself.
+    const custodyNote = `${note} — verified by ${req.user.email || `user#${req.user.id}`}`;
     const logged = onChain.available && onChain.exists
-      ? await chain.logVerification(ev.sha256_hash, isValid, note)
+      ? await chain.logVerification(ev.sha256_hash, isValid, custodyNote)
       : { ok: false, reason: onChain.reason || 'not registered on-chain' };
 
     await pool.query(
@@ -207,7 +244,7 @@ async function download(req, res, next) {
     if (!ev) return res.status(404).json({ error: 'Evidence not found' });
 
     const ciphertext = await storage.read(ev.encrypted_path);
-    const plaintext = crypto.decrypt(ciphertext, ev.iv, ev.auth_tag);
+    const plaintext = crypto.decrypt(ciphertext, ev.iv, ev.auth_tag, aadFor(ev.id), ev.key_version);
 
     await audit.log({
       actorId: req.user.id, action: 'EVIDENCE_DOWNLOADED', entityType: 'evidence', entityId: id,
@@ -246,4 +283,58 @@ async function chainTransactions(req, res, next) {
   } catch (err) { next(err); }
 }
 
-module.exports = { list, upload, verify, history, download, chainStatus, chainTransactions };
+/**
+ * POST /api/evidence/integrity-sweep (ADMIN)
+ *
+ * Reactive verification only runs when someone asks about one exhibit.
+ * Disk-level tampering on an exhibit nobody happens to be re-checking would
+ * otherwise sit undetected indefinitely. This walks every exhibit, attempts
+ * decrypt + digest recompute, and reports anomalies — without writing to the
+ * chain, since a sweep is a detection pass, not a formal custody check
+ * (that stays investigator-initiated via /verify).
+ */
+async function integritySweep(req, res, next) {
+  try {
+    const { rows } = await pool.query(
+      `SELECT id, title, sha256_hash, encrypted_path, iv, auth_tag, key_version FROM evidence`
+    );
+    const results = [];
+    for (const ev of rows) {
+      try {
+        const ciphertext = await storage.read(ev.encrypted_path);
+        const plaintext = crypto.decrypt(ciphertext, ev.iv, ev.auth_tag, aadFor(ev.id), ev.key_version);
+        const computed = hashService.sha256(plaintext);
+        if (computed !== ev.sha256_hash) {
+          results.push({ id: ev.id, title: ev.title, ok: false, reason: 'digest mismatch — exhibit altered at rest' });
+        }
+      } catch (e) {
+        results.push({ id: ev.id, title: ev.title, ok: false, reason: e.message });
+      }
+    }
+
+    await audit.log({
+      actorId: req.user.id, action: 'EVIDENCE_INTEGRITY_SWEEP', entityType: 'evidence',
+      metadata: { scanned: rows.length, anomalies: results.length },
+      ipAddress: audit.clientIp(req),
+    });
+
+    res.json({ scanned: rows.length, anomalies: results });
+  } catch (err) { next(err); }
+}
+
+/** POST /api/chain/retry-failed (ADMIN) — manual trigger alongside the automatic sweep. */
+async function retryFailedAnchors(req, res, next) {
+  try {
+    const result = await chain.retryFailedAnchors();
+    await audit.log({
+      actorId: req.user.id, action: 'CHAIN_RETRY_TRIGGERED', entityType: 'evidence_anchors',
+      metadata: result, ipAddress: audit.clientIp(req),
+    });
+    res.json(result);
+  } catch (err) { next(err); }
+}
+
+module.exports = {
+  list, upload, verify, history, download, chainStatus, chainTransactions,
+  integritySweep, retryFailedAnchors,
+};
