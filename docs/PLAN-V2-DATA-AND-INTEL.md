@@ -357,12 +357,28 @@ falls back to its own regex tier when the service is unreachable, and the
 response labels which one ran (`extraction.tier`, `extraction.degraded`). The
 fixtures are shared between both implementations so they cannot drift.
 
-**spaCy is not installed and that is fine.** It has no wheels for Python 3.14,
-and §4 says regex carries the demo while NER is strictly additive. `/health`
-reports `spacy_loaded: false` plainly rather than quietly returning fewer
-entities. Every identifier the correlation engine links on — phone, UPI, bank
-account, wallet, email, IP, Telegram — comes from the deterministic tier. Only
-the soft PERSON/LOCATION tier is absent; use a 3.12 interpreter if it is wanted.
+**spaCy is installed and the NER tier is live.** The earlier note here said it
+had no wheels for Python 3.14; that is no longer true — spaCy 3.8.16 and
+`en_core_web_sm` 3.8.0 install cleanly on 3.14.6, and `/health` now reports
+`spacy_loaded: true`. Both tiers run: regex finds every identifier the
+correlation engine links on (phone, UPI, bank account, wallet, email, IP,
+Telegram), and NER adds suspect names on top.
+
+**NER contributes PERSON only — GPE/LOC are dropped deliberately.** Two reasons,
+and the first was found by testing rather than reasoning. This is an *English*
+model reading Hinglish, and on a real narrative it tagged "Maine" (Hindi "I")
+and "hai" ("is") as places, because both are also plausible English place
+tokens. Those words appear in most filings, so each would become one entity
+shared by hundreds of unrelated complaints.
+
+The second reason holds even for a correctly-identified city: **geography is not
+evidence of connection.** Two victims both living in Mumbai were not scammed by
+the same gang. A shared city node bridges every cluster to every other and
+drowns the real structure — the seeder had exactly this bug, and removing
+location nodes is what fixed it. Where a complaint happened lives on the
+complaint row as state/district and drives the Geo page; it never correlates.
+A single-token name is dropped for the same reason: a bare "Rahul" would merge
+every unrelated Rahul in the corpus into one suspect.
 
 **Known gap, stated rather than hidden:** the `CIRCULAR_FLOW` rule matches 0 rows
 against the current seed, because the seeded money flow is a linear ladder —

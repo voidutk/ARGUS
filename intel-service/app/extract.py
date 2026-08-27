@@ -248,15 +248,37 @@ def _ner(text: str, claims: _Claims) -> list[dict]:
 
     found: list[dict] = []
     for ent in _nlp(text).ents:
-        if ent.label_ not in ("PERSON", "GPE", "LOC"):
+        # PERSON only.
+        #
+        # GPE/LOC are deliberately dropped, for two compounding reasons.
+        #
+        # First, this is an ENGLISH model reading Hinglish. On a real narrative
+        # it tagged "Maine" (Hindi "I") and "hai" ("is") as places, because they
+        # are also a US state and a plausible token. Those words appear in most
+        # filings, so each would become a single entity shared by hundreds of
+        # unrelated complaints.
+        #
+        # Second — and this holds even for a correct city — geography is not
+        # evidence of connection. Two victims both living in Mumbai were not
+        # scammed by the same gang. A shared city node bridges every cluster to
+        # every other and drowns the real structure; the seeder had exactly this
+        # bug and dropping location nodes is what fixed it (see seed.js,
+        # makeComplaint). Where a complaint happened lives on the complaint row
+        # as state/district and drives the Geo page. It never correlates.
+        if ent.label_ != "PERSON":
             continue
         if claims.overlaps(ent.start_char, ent.end_char):
             continue
 
-        entity_type = "PERSON" if ent.label_ == "PERSON" else "LOCATION"
+        entity_type = "PERSON"
         value = ent.text.strip()
         # Single tokens under three characters are almost always a parse slip.
         if len(value) < 3:
+            continue
+        # A person's name has at least two parts. A bare first name is both a
+        # common Hinglish false positive and useless for correlation — "Rahul"
+        # alone would merge every unrelated Rahul in the corpus into one suspect.
+        if " " not in value:
             continue
 
         claims.take(ent.start_char, ent.end_char)
