@@ -28,6 +28,9 @@ const zlib = require('zlib');
 const pool = require('./pool');
 const hashService = require('../services/hashService');
 const cryptoService = require('../services/cryptoService');
+
+// Must match evidenceController.aadFor — the ciphertext is bound to its row id.
+const aadFor = (evidenceId) => `evidence:${evidenceId}`;
 const storage = require('../services/storageService');
 const chain = require('../services/chainService');
 
@@ -513,24 +516,49 @@ const EXHIBITS = [
 async function seal(ex) {
   const plaintext = ex.build();
   const sha256 = hashService.sha256(plaintext);
-  const { ciphertext, iv, authTag } = cryptoService.encrypt(plaintext);
-  const storedName = await storage.write(ciphertext);
 
-  let row;
+  /**
+   * Reserve the row FIRST, then encrypt against its id.
+   *
+   * The ciphertext is bound to this row by AAD (`evidence:<id>`), so the id has
+   * to exist before the sealing can happen — hence the blank-crypto insert and
+   * the UPDATE, exactly as evidenceController.upload does it. Seeding by any
+   * other route produces exhibits that decrypt under the raw key but fail the
+   * AAD check, which presents as "stored bytes unreadable" on every verify.
+   *
+   * That is not hypothetical: this function used to call `encrypt(plaintext)`
+   * with no AAD, and after the evidence-hardening merge every seeded exhibit in
+   * the locker failed verification. Any future path that writes evidence must
+   * bind the same AAD and record the same key_version, or it will do it again.
+   */
+  const { rows: reserved } = await pool.query(
+    `INSERT INTO evidence (complaint_id, title, filename, mime_type, size_bytes, evidence_type,
+                           sha256_hash, encrypted_path, iv, auth_tag, uploaded_by, created_at)
+     VALUES ($1,$2,$3,$4,$5,$6,'', '', '', '', $7, now() - ($8 || ' days')::interval)
+     RETURNING id, created_at`,
+    [ex.complaint, ex.title, ex.filename, ex.mime, plaintext.length, ex.type,
+      ex.by, String(ex.ageDays)]
+  );
+  const row = reserved[0];
+
   try {
-    const { rows } = await pool.query(
-      `INSERT INTO evidence (complaint_id, title, filename, mime_type, size_bytes, evidence_type,
-                             sha256_hash, encrypted_path, iv, auth_tag, uploaded_by, created_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11, now() - ($12 || ' days')::interval)
-       RETURNING id, created_at`,
-      [ex.complaint, ex.title, ex.filename, ex.mime, plaintext.length, ex.type,
-        sha256, storedName, iv, authTag, ex.by, String(ex.ageDays)]
-    );
-    row = rows[0];
+    const { ciphertext, iv, authTag, keyVersion } = cryptoService.encrypt(plaintext, aadFor(row.id));
+    const storedName = await storage.write(ciphertext);
+
+    try {
+      await pool.query(
+        `UPDATE evidence SET sha256_hash=$2, encrypted_path=$3, iv=$4, auth_tag=$5, key_version=$6
+          WHERE id=$1`,
+        [row.id, sha256, storedName, iv, authTag, keyVersion]
+      );
+    } catch (err) {
+      // Same ordering guarantee the upload controller makes: an orphaned
+      // ciphertext is recoverable, a row pointing at a missing file is not.
+      await storage.remove(storedName).catch(() => {});
+      throw err;
+    }
   } catch (err) {
-    // Same ordering guarantee the upload controller makes: an orphaned
-    // ciphertext is recoverable, a row pointing at a missing file is not.
-    await storage.remove(storedName).catch(() => {});
+    await pool.query('DELETE FROM evidence WHERE id=$1', [row.id]).catch(() => {});
     throw err;
   }
 
