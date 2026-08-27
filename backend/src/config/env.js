@@ -54,6 +54,25 @@ if (evidenceEncryptionKey && !/^[0-9a-fA-F]{64}$/.test(evidenceEncryptionKey)) {
 }
 
 /**
+ * Key rotation. EVIDENCE_ENCRYPTION_KEY_VERSION is the version stamped on
+ * every NEWLY encrypted exhibit; EVIDENCE_ENCRYPTION_KEY_PREVIOUS holds
+ * retired keys as "version:hexkey" pairs, comma-separated, so an exhibit
+ * sealed under an old key stays decryptable after the active key rotates —
+ * see cryptoService.js's keyring(). Format-checked here, same as the active
+ * key above, so a malformed retired key is caught at boot rather than the
+ * first time someone tries to open an exhibit sealed under it.
+ */
+const evidenceEncryptionKeyVersion = integer('EVIDENCE_ENCRYPTION_KEY_VERSION', 1, { min: 1 });
+const evidenceEncryptionKeyPrevious = process.env.EVIDENCE_ENCRYPTION_KEY_PREVIOUS || '';
+if (evidenceEncryptionKeyPrevious) {
+  for (const entry of evidenceEncryptionKeyPrevious.split(',').map((s) => s.trim()).filter(Boolean)) {
+    if (!/^\d+:[0-9a-fA-F]{64}$/.test(entry)) {
+      problems.push(`EVIDENCE_ENCRYPTION_KEY_PREVIOUS entry "${entry}" is malformed — expected "version:64hexchars"`);
+    }
+  }
+}
+
+/**
  * Production-only checks.
  *
  * The development defaults are deliberately permissive so a fresh clone runs
@@ -117,6 +136,8 @@ module.exports = {
   // Evidence files are encrypted at rest with AES-256-GCM; only the SHA-256 of
   // the plaintext ever leaves this service (to the chain).
   evidenceEncryptionKey,
+  evidenceEncryptionKeyVersion,
+  evidenceEncryptionKeyPrevious,
   maxUploadMb: integer('MAX_UPLOAD_MB', 25, { min: 1, max: 500 }),
   storageDir: process.env.STORAGE_DIR || 'storage/evidence',
 
@@ -142,6 +163,15 @@ module.exports = {
   loginRateLimit: integer('LOGIN_RATE_LIMIT', isProduction ? 10 : 200, { min: 1 }),
   apiRateLimit: integer('API_RATE_LIMIT', isProduction ? 300 : 3_000, { min: 1 }),
   writeRateLimit: integer('WRITE_RATE_LIMIT', isProduction ? 60 : 600, { min: 1 }),
+
+  // Per-account login lockout, independent of the per-IP limiters above — it
+  // catches an attacker spreading guesses across IPs at one account instead of
+  // hammering one IP across many accounts. Generous in development: smoke.js
+  // and evidence-e2e.js each trigger one failed login per run against a shared
+  // seeded account, and repeated dev/demo-rehearsal runs must not lock
+  // investigators out of their own account.
+  loginLockoutThreshold: integer('LOGIN_LOCKOUT_THRESHOLD', isProduction ? 10 : 100, { min: 1 }),
+  loginLockoutWindowMin: integer('LOGIN_LOCKOUT_WINDOW_MIN', 15, { min: 1 }),
 
   // Behind nginx/a load balancer this must be set, or every client looks like
   // the proxy and one visitor can rate-limit everyone else out of the service.

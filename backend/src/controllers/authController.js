@@ -3,7 +3,7 @@ const jwt = require('jsonwebtoken');
 const pool = require('../db/pool');
 const env = require('../config/env');
 const audit = require('../services/auditService');
-const { asyncHandler, unauthorized, notFound } = require('../lib/errors');
+const { asyncHandler, unauthorized, notFound, ApiError } = require('../lib/errors');
 
 const ROLES = ['ADMIN', 'SUPERVISOR', 'INVESTIGATOR', 'ANALYST'];
 
@@ -51,6 +51,27 @@ const DUMMY_HASH = '$2b$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy
 
 const login = asyncHandler(async (req, res) => {
   const { email, password } = req.valid.body;
+
+  // Per-ACCOUNT lockout, independent of loginLimiter's per-IP window. An
+  // attacker spreading guesses across many IPs (or behind a rotating proxy)
+  // never trips the IP limiter but still hits this one, since it counts
+  // failures against the target account regardless of where they came from.
+  // Checked before bcrypt so a locked-out account also stops burning CPU on
+  // hash comparisons.
+  const { rows: recentFailures } = await pool.query(
+    `SELECT count(*)::int AS n FROM audit_logs
+      WHERE action = 'LOGIN_FAILED' AND metadata->>'email' = $1
+        AND created_at > now() - ($2 || ' minutes')::interval`,
+    [email, String(env.loginLockoutWindowMin)]
+  );
+  if (recentFailures[0].n >= env.loginLockoutThreshold) {
+    await audit.log({
+      action: 'LOGIN_LOCKED', entityType: 'user',
+      metadata: { email }, ipAddress: audit.clientIp(req),
+    });
+    throw new ApiError(429, 'Too many failed sign-in attempts for this account. Try again later.',
+      { code: 'ACCOUNT_LOCKED' });
+  }
 
   const { rows } = await pool.query(`${USER_SELECT} WHERE u.email = $1`, [email]);
   const user = rows[0];

@@ -134,6 +134,11 @@ async function main() {
   );
   const iv = crypto.randomBytes(12);
   const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+  // Must match evidenceController.aadFor(ev.id) — this re-encryption keeps the
+  // SAME row identity, so it should still decrypt cleanly and be caught by the
+  // digest comparison, not by an AAD mismatch. The AAD-mismatch case (a
+  // DIFFERENT row's crypto envelope) is exercised separately below.
+  cipher.setAAD(Buffer.from(`evidence:${ev.id}`, 'utf8'));
   const ct = Buffer.concat([cipher.update(forged), cipher.final()]);
 
   const storeDir = path.resolve(process.cwd(), process.env.STORAGE_DIR || 'storage/evidence');
@@ -170,6 +175,53 @@ async function main() {
   onChain.forEach((h, i) => {
     console.log(`    ${i + 1}. ${h.matched ? 'MATCH   ' : 'MISMATCH'}  ${h.checked_at}  "${h.note}"`);
   });
+
+  // --- cross-row AAD binding ------------------------------------------------
+  // A harder attack than editing one file: copy ANOTHER exhibit's entire
+  // crypto envelope (ciphertext + iv + auth_tag) onto this row. Before AAD
+  // binding, if the attacker also overwrote sha256_hash to match, this would
+  // decrypt cleanly and hash-match — a full identity swap invisible to the
+  // digest check alone. AAD ties ciphertext to the row's OWN id, so decrypting
+  // under evidence A's id with evidence B's envelope must fail outright.
+  console.log('\n  -- cross-row swap: exhibit B\'s crypto envelope copied onto exhibit A\'s row --\n');
+
+  const content2 = Buffer.from(`unrelated exhibit ${crypto.randomBytes(8).toString('hex')}\n`);
+  const form2 = new FormData();
+  form2.append('file', new Blob([content2], { type: 'text/plain' }), 'exhibit-b.txt');
+  form2.append('title', 'E2E exhibit B — for cross-row swap test');
+  form2.append('evidence_type', 'CHAT_LOG');
+  const up2 = await fetch(`${BASE}/api/evidence/upload`, {
+    method: 'POST', headers: { Authorization: `Bearer ${token}` }, body: form2,
+  });
+  const evB = (await up2.json()).evidence;
+  check('second exhibit uploaded for the swap test', up2.status === 201);
+
+  const { rows: bRows } = await pool.query(
+    'SELECT encrypted_path, iv, auth_tag FROM evidence WHERE id=$1', [evB.id]
+  );
+  const bCiphertext = fs.readFileSync(path.join(storeDir, bRows[0].encrypted_path));
+  fs.writeFileSync(path.join(storeDir, stored.encrypted_path), bCiphertext);
+  await pool.query('UPDATE evidence SET iv=$2, auth_tag=$3 WHERE id=$1',
+    [ev.id, bRows[0].iv, bRows[0].auth_tag]);
+
+  const v3 = await api('POST', `/api/evidence/${ev.id}/verify`);
+  check('verify FAILS when another exhibit\'s envelope is substituted whole',
+    v3.body?.is_valid === false, v3.body?.note);
+  check('the cause is an unreadable/unauthenticated envelope, not just a hash mismatch',
+    typeof v3.body?.note === 'string' && v3.body.note.includes('unreadable'),
+    `note was "${v3.body?.note}"`);
+
+  // --- RBAC on raw evidence access ------------------------------------------
+  console.log('\n  -- RBAC: an ANALYST must not be able to download raw evidence --\n');
+
+  const analystLogin = await fetch(`${BASE}/api/auth/login`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email: 'analyst@argus.gov.in', password: 'argus2026' }),
+  }).then((r) => r.json());
+  const dl = await fetch(`${BASE}/api/evidence/${ev.id}/download`, {
+    headers: { Authorization: `Bearer ${analystLogin.token}` },
+  });
+  check('ANALYST gets 403 on evidence download', dl.status === 403, `got ${dl.status}`);
 
   await pool.end();
 

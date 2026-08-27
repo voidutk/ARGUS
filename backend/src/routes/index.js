@@ -37,10 +37,43 @@ const router = express.Router();
 // plaintext never touches disk. `files: 1` matters as much as the size cap — a
 // request with 500 small files would otherwise pass the size limit and exhaust
 // memory one part at a time.
+//
+// fileFilter is a plausibility check, not a security boundary by itself —
+// MIME type is client-supplied and trivially spoofable — but it does stop
+// obviously-wrong uploads (executables, archives) before they are ever
+// encrypted and anchored as if they were legitimate evidence. The real XSS
+// defense is in evidenceController.download(), which never trusts this value
+// on the way back out.
+const ALLOWED_EVIDENCE_MIME = new Set([
+  'image/png', 'image/jpeg', 'image/webp', 'image/gif',
+  'application/pdf',
+  'text/plain', 'text/csv',
+  'application/vnd.ms-excel',
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  'application/msword',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  'audio/mpeg', 'audio/wav', 'audio/ogg', 'audio/mp4',
+  'video/mp4',
+]);
+
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: env.maxUploadMb * 1024 * 1024, files: 1, fields: 12 },
+  fileFilter: (req, file, cb) => {
+    if (!ALLOWED_EVIDENCE_MIME.has(file.mimetype)) {
+      const err = new Error(`rejected upload: unsupported mime type "${file.mimetype}"`);
+      err.status = 400;
+      err.publicMessage = `File type "${file.mimetype}" is not accepted as evidence`;
+      return cb(err);
+    }
+    cb(null, true);
+  },
 });
+
+// Roles that legitimately handle raw exhibit bytes. ANALYST can still see
+// metadata and the custody trail via list()/history() — just not the
+// decrypted file itself.
+const EVIDENCE_ROLES = ['ADMIN', 'SUPERVISOR', 'INVESTIGATOR'];
 
 /**
  * Graph node ids look like `wallet:0x4a2b…`, `complaint:812`, or
@@ -312,6 +345,7 @@ router.get('/evidence',
 
 router.post('/evidence/upload',
   writeLimiter,
+  rbac(...EVIDENCE_ROLES),
   upload.single('file'),
   // Runs AFTER multer, which is what populates req.body for a multipart request.
   validate({
@@ -325,6 +359,7 @@ router.post('/evidence/upload',
 
 router.post('/evidence/:id/verify',
   writeLimiter,
+  rbac(...EVIDENCE_ROLES),
   validate({ params: z.object({ id: idParam }) }),
   evidence.verify);
 
@@ -339,11 +374,15 @@ router.get('/evidence/:id/history',
   evidence.history);
 
 router.get('/evidence/:id/download',
+  rbac(...EVIDENCE_ROLES),
   validate({ params: z.object({ id: idParam }) }),
   evidence.download);
 
+router.post('/evidence/integrity-sweep', writeLimiter, rbac('ADMIN'), evidence.integritySweep);
+
 router.get('/chain/status', evidence.chainStatus);
 router.get('/chain/transactions', evidence.chainTransactions);
+router.post('/chain/retry-failed', writeLimiter, rbac('ADMIN'), evidence.retryFailedAnchors);
 
 // --- admin -----------------------------------------------------------------
 router.get('/admin/users', rbac('ADMIN', 'SUPERVISOR'), I.adminUsers);

@@ -70,6 +70,19 @@ async function doInit() {
       return state;
     }
 
+    // The unlocked-account fallback further down only makes sense against a
+    // local Hardhat node, which exposes signer 0 with no key needed. Against
+    // any other network (amoy, mainnet, ...) there is no unlocked account to
+    // get — attempting it would either throw an opaque RPC error or, worse on
+    // some providers, silently resolve to an address nobody controls. Refuse
+    // explicitly instead of letting that ambiguity reach demo day.
+    const isLocalNetwork = network === 'localhost' || network === 'hardhat';
+    if (!env.chainPrivateKey && !isLocalNetwork) {
+      state = { ...state, ready: false, network,
+        reason: `CHAIN_PRIVATE_KEY is required for network "${network}" — refusing the unlocked local-signer fallback against a remote RPC` };
+      return state;
+    }
+
     // `provider` is the connection to whichever chain is configured — the local
     // Hardhat node (http://127.0.0.1:8545) in dev, or the real Polygon Amoy
     // testnet RPC on demo day. Everything below talks through this one object.
@@ -119,8 +132,10 @@ function explorerUrl(txHash) {
 }
 
 async function markFailed(evidenceId, reason) {
-  await pool.query(`UPDATE evidence_anchors SET status='FAILED' WHERE evidence_id=$1`, [evidenceId])
-    .catch(() => {});
+  await pool.query(
+    `UPDATE evidence_anchors SET status='FAILED', last_attempt_at=now() WHERE evidence_id=$1`,
+    [evidenceId]
+  ).catch(() => {});
   console.error(`anchor failed for evidence ${evidenceId}: ${reason}`);
 }
 
@@ -281,7 +296,42 @@ async function totalRegistered() {
   try { return Number(await state.contract.totalRegistered()); } catch { return null; }
 }
 
+const MAX_ANCHOR_RETRIES = 5;
+const RETRY_COOLDOWN = '2 minutes';
+
+/**
+ * Requeues anchors that never made it to ANCHORED. Complements the manual
+ * per-exhibit POST /evidence/:id/anchor (evidenceController.reanchor): this
+ * sweep is what catches the exhibit nobody happened to notice was stuck, on a
+ * schedule instead of on request. Capped by retry_count and cooled down by
+ * last_attempt_at so a genuinely broken chain does not turn into a tight loop.
+ */
+async function retryFailedAnchors() {
+  const { rows } = await pool.query(
+    `SELECT evidence_id FROM evidence_anchors
+      WHERE status IN ('FAILED', 'PENDING') AND retry_count < $1
+        AND (last_attempt_at IS NULL OR last_attempt_at < now() - interval '${RETRY_COOLDOWN}')`,
+    [MAX_ANCHOR_RETRIES]
+  );
+  for (const row of rows) {
+    await pool.query(
+      `UPDATE evidence_anchors SET retry_count = retry_count + 1, last_attempt_at = now() WHERE evidence_id=$1`,
+      [row.evidence_id]
+    );
+    await anchorEvidence(row.evidence_id);
+  }
+  return { attempted: rows.length };
+}
+
+/** Call once at startup. Returns the interval handle (already unref'd). */
+function startAnchorRetrySweep(intervalMs = 5 * 60 * 1000) {
+  return setInterval(() => {
+    retryFailedAnchors().catch((err) => console.error('anchor retry sweep failed:', err.message));
+  }, intervalMs).unref();
+}
+
 module.exports = {
   init, status, anchorEvidence, queueAnchor, verifyOnChain,
   logVerification, getHistory, totalRegistered, explorerUrl,
+  retryFailedAnchors, startAnchorRetrySweep,
 };

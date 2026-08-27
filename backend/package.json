@@ -24,9 +24,11 @@
     "smoke-v2": "node scripts/smoke-v2.js",
     "evidence-e2e": "node scripts/evidence-e2e.js",
     "verify-all": "npm run test:unit && npm run verify-determinism && npm run verify-plant && npm run smoke && npm run smoke-v2 && npm run evidence-e2e",
+    "verify-extraction": "node scripts/verify-extraction.js",
+    "integrity-sweep": "node scripts/integrity-sweep.js",
+    "rotate-evidence-key": "node scripts/rotate-evidence-key.js",
     "seed:evidence": "node src/db/seedEvidence.js",
     "compute-scores": "node scripts/compute-scores.js",
-    "verify-extraction": "node scripts/verify-extraction.js",
     "project-neo4j": "node scripts/project-neo4j.js"
   },
   "dependencies": {

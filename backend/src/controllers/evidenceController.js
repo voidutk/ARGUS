@@ -7,6 +7,14 @@ const audit = require('../services/auditService');
 const logger = require('../lib/logger');
 const { asyncHandler, notFound, badRequest } = require('../lib/errors');
 
+// Binds ciphertext to the specific evidence row via AES-GCM's AAD (see
+// cryptoService.encrypt). Using the row's own primary key means an attacker
+// with DB + disk write access cannot copy another exhibit's entire crypto
+// envelope (ciphertext + iv + auth_tag + sha256_hash) onto this row's identity
+// and have it decrypt and hash-match cleanly — the AAD used at encryption time
+// would not match this row's id.
+const aadFor = (evidenceId) => `evidence:${evidenceId}`;
+
 const anchorView = (r) => ({
   status: r.anchor_status || 'PENDING',
   tx_hash: r.tx_hash || null,
@@ -80,6 +88,13 @@ const list = asyncHandler(async (req, res) => {
  * The SHA-256 is taken over the PLAINTEXT, before encryption. Ciphertext gets a
  * fresh IV every time it is written, so a ciphertext digest would never match
  * across re-encryption and would prove nothing about the exhibit.
+ *
+ * The row is reserved (a placeholder INSERT) before encrypting, so the AAD can
+ * bind ciphertext to the row's own immutable id — encrypting first would leave
+ * nothing stable to bind to, since the id does not exist yet. If anything
+ * fails after the reservation, the row is deleted rather than left dangling:
+ * a reserved row with blank crypto fields is exactly the "row pointing at
+ * nothing" case that must never survive a failed upload.
  */
 const upload = asyncHandler(async (req, res) => {
   if (!req.file) throw badRequest('No file uploaded — send it as multipart field "file"');
@@ -89,27 +104,42 @@ const upload = asyncHandler(async (req, res) => {
 
   const plaintext = req.file.buffer;
   const sha256 = hashService.sha256(plaintext);
-  const { ciphertext, iv, authTag } = cryptoService.encrypt(plaintext);
 
-  // Written to disk BEFORE the row exists, so the only possible inconsistency
-  // is an orphaned ciphertext with no row — recoverable, and cleaned up below.
-  // The reverse (a row pointing at a file that was never written) would be an
-  // exhibit that cannot be produced, which is not recoverable.
-  const storedName = await storage.write(ciphertext);
+  const { rows: reserved } = await pool.query(
+    `INSERT INTO evidence (complaint_id, title, filename, mime_type, size_bytes, evidence_type,
+                           sha256_hash, encrypted_path, iv, auth_tag, uploaded_by)
+     VALUES ($1,$2,$3,$4,$5,$6,'', '', '', '', $7) RETURNING id`,
+    [complaint_id, title || req.file.originalname, req.file.originalname, req.file.mimetype,
+      plaintext.length, evidence_type, req.user.id]
+  );
+  const id = reserved[0].id;
 
   let ev;
   try {
-    const { rows } = await pool.query(
-      `INSERT INTO evidence (complaint_id, title, filename, mime_type, size_bytes, evidence_type,
-                             sha256_hash, encrypted_path, iv, auth_tag, uploaded_by)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *`,
-      [complaint_id, title || req.file.originalname, req.file.originalname, req.file.mimetype,
-        plaintext.length, evidence_type, sha256, storedName, iv, authTag, req.user.id]
-    );
-    ev = rows[0];
+    const { ciphertext, iv, authTag, keyVersion } = cryptoService.encrypt(plaintext, aadFor(id));
+
+    // Written to disk before the row is finalised, so the only possible
+    // inconsistency if the next step fails is an orphaned ciphertext with no
+    // completed row — recoverable, and cleaned up below. The reverse (a
+    // completed row pointing at a file that was never written) would be an
+    // exhibit that cannot be produced, which is not recoverable.
+    const storedName = await storage.write(ciphertext);
+
+    try {
+      const { rows } = await pool.query(
+        `UPDATE evidence SET sha256_hash=$2, encrypted_path=$3, iv=$4, auth_tag=$5, key_version=$6
+          WHERE id=$1 RETURNING *`,
+        [id, sha256, storedName, iv, authTag, keyVersion]
+      );
+      ev = rows[0];
+    } catch (err) {
+      await storage.remove(storedName).catch((rmErr) =>
+        logger.error({ err: rmErr.message, file: storedName }, 'orphaned ciphertext could not be removed'));
+      throw err;
+    }
   } catch (err) {
-    await storage.remove(storedName).catch((rmErr) =>
-      logger.error({ err: rmErr.message, file: storedName }, 'orphaned ciphertext could not be removed'));
+    await pool.query('DELETE FROM evidence WHERE id=$1', [id]).catch((delErr) =>
+      logger.error({ err: delErr.message, id }, 'failed to clean up a reserved evidence row'));
     throw err;
   }
 
@@ -164,10 +194,12 @@ const verify = asyncHandler(async (req, res) => {
   let readError = null;
   try {
     const ciphertext = await storage.read(ev.encrypted_path);
-    const plaintext = cryptoService.decrypt(ciphertext, ev.iv, ev.auth_tag);
+    const plaintext = cryptoService.decrypt(ciphertext, ev.iv, ev.auth_tag, aadFor(ev.id), ev.key_version);
     computedHash = hashService.sha256(plaintext);
   } catch (e) {
-    // AES-GCM refusing to decrypt IS a tamper signal, not an incidental error.
+    // AES-GCM refusing to decrypt IS a tamper signal, not an incidental error
+    // — including a wrong-AAD failure, which now also means "this row's
+    // crypto envelope did not originate from this row".
     readError = e.message;
   }
 
@@ -180,8 +212,14 @@ const verify = asyncHandler(async (req, res) => {
     : !onChain.exists ? 'digest matches but is not registered on-chain'
     : 'integrity confirmed';
 
+  // The relayer wallet submits every anchoring/logging transaction, so
+  // on-chain msg.sender is always the same address regardless of which
+  // investigator actually ran the check — the chain alone cannot tell them
+  // apart. Folding the investigator's identity into the note is what keeps
+  // per-officer accountability inside the immutable custody trail itself.
+  const custodyNote = `${note} — verified by ${req.user.email || `user#${req.user.id}`}`;
   const logged = onChain.available && onChain.exists
-    ? await chain.logVerification(ev.sha256_hash, isValid, note)
+    ? await chain.logVerification(ev.sha256_hash, isValid, custodyNote)
     : { ok: false, reason: onChain.reason || 'not registered on-chain' };
 
   await pool.query(
@@ -264,7 +302,7 @@ const download = asyncHandler(async (req, res) => {
   if (!ev) throw notFound('Evidence');
 
   const ciphertext = await storage.read(ev.encrypted_path);
-  const plaintext = cryptoService.decrypt(ciphertext, ev.iv, ev.auth_tag);
+  const plaintext = cryptoService.decrypt(ciphertext, ev.iv, ev.auth_tag, aadFor(ev.id), ev.key_version);
 
   await audit.log({
     actorId: req.user.id,
@@ -317,6 +355,8 @@ const chainTransactions = asyncHandler(async (req, res) => {
  * Retries an anchor that failed or is stuck PENDING because the chain was down
  * when it was uploaded. Without this, an exhibit uploaded during an RPC outage
  * stays unanchored forever and the custody claim quietly does not apply to it.
+ * Complements the automatic bulk sweep (chain.startAnchorRetrySweep) with an
+ * on-demand retry for one exhibit an investigator is looking at right now.
  */
 const reanchor = asyncHandler(async (req, res) => {
   const { id } = req.valid.params;
@@ -346,7 +386,60 @@ const reanchor = asyncHandler(async (req, res) => {
   res.status(result.status === 'ANCHORED' ? 200 : 202).json(result);
 });
 
+/**
+ * POST /api/evidence/integrity-sweep — ADMIN.
+ *
+ * Reactive verification (verify(), above) only runs when someone asks about
+ * one exhibit. Disk-level tampering on an exhibit nobody happens to be
+ * re-checking would otherwise sit undetected indefinitely. This walks every
+ * exhibit, attempts decrypt + digest recompute, and reports anomalies —
+ * without writing to the chain, since a sweep is a detection pass, not a
+ * formal custody check (that stays investigator-initiated via /verify).
+ */
+const integritySweep = asyncHandler(async (req, res) => {
+  const { rows } = await pool.query(
+    `SELECT id, title, sha256_hash, encrypted_path, iv, auth_tag, key_version FROM evidence`
+  );
+  const results = [];
+  for (const ev of rows) {
+    try {
+      const ciphertext = await storage.read(ev.encrypted_path);
+      const plaintext = cryptoService.decrypt(ciphertext, ev.iv, ev.auth_tag, aadFor(ev.id), ev.key_version);
+      const computed = hashService.sha256(plaintext);
+      if (computed !== ev.sha256_hash) {
+        results.push({ id: ev.id, title: ev.title, ok: false, reason: 'digest mismatch — exhibit altered at rest' });
+      }
+    } catch (e) {
+      results.push({ id: ev.id, title: ev.title, ok: false, reason: e.message });
+    }
+  }
+
+  await audit.log({
+    actorId: req.user.id,
+    action: 'EVIDENCE_INTEGRITY_SWEEP',
+    entityType: 'evidence',
+    metadata: { scanned: rows.length, anomalies: results.length },
+    ipAddress: audit.clientIp(req),
+  });
+
+  res.json({ scanned: rows.length, anomalies: results });
+});
+
+/** POST /api/chain/retry-failed — ADMIN. Manual trigger alongside the automatic sweep. */
+const retryFailedAnchors = asyncHandler(async (req, res) => {
+  const result = await chain.retryFailedAnchors();
+  await audit.log({
+    actorId: req.user.id,
+    action: 'CHAIN_RETRY_TRIGGERED',
+    entityType: 'evidence_anchors',
+    metadata: result,
+    ipAddress: audit.clientIp(req),
+  });
+  res.json(result);
+});
+
 module.exports = {
   list, upload, verify, history, download, chainStatus, chainTransactions, reanchor,
+  integritySweep, retryFailedAnchors,
   contentDisposition,
 };

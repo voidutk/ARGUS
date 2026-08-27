@@ -41,6 +41,12 @@ async function reportDependencies() {
     ? `up — ${c.network} @ ${c.address}`
     : `down — ${c.reason} (uploads still work, anchors stay PENDING)`);
   console.log('');
+
+  // Sweeps every 5 minutes for anchors stuck FAILED/PENDING and requeues them,
+  // so a transient RPC outage during one upload does not leave that exhibit
+  // unanchored until someone notices by hand — complements the manual
+  // per-exhibit POST /evidence/:id/anchor.
+  chain.startAnchorRetrySweep();
 }
 
 async function start() {
